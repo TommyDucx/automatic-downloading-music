@@ -11,7 +11,23 @@ const CONFIG = {
     // 支持的域名
     DOMAINS: {
         ORIGINAL: 'music.gdstudio.org',
-        INTERNATIONAL: 'music-api.gdstudio.xyz'
+        INTERNATIONAL: 'music-api.gdstudio.xyz',
+        // 镜像分流（参考 gdstudio-embeded-service config.yaml）
+        MIRRORS: {
+            cn: 'music-api-cn.gdstudio.xyz',
+            hk: 'music-api-hk.gdstudio.xyz',
+            us: 'music-api-us.gdstudio.xyz'
+        }
+    },
+
+    // 音源 -> 镜像（migu/kugou/ximalaya→cn，joox→hk，qobuz/ytmusic→us，其余默认）
+    MIRROR_BY_SOURCE: {
+        migu: 'cn',
+        kugou: 'cn',
+        ximalaya: 'cn',
+        joox: 'hk',
+        qobuz: 'us',
+        ytmusic: 'us'
     },
     
     // 默认设置
@@ -51,6 +67,12 @@ function crc32(input) {
 
 function crc32Hex(input) {
     return crc32(input).toString(16).toUpperCase().padStart(8, '0');
+}
+
+// 按音源选择镜像域名
+function domainForSource(source) {
+    const mirror = CONFIG.MIRROR_BY_SOURCE[source];
+    return mirror ? CONFIG.DOMAINS.MIRRORS[mirror] : CONFIG.DOMAINS.INTERNATIONAL;
 }
 
 // 工具函数
@@ -397,13 +419,16 @@ async function main() {
     
     if (args.length < 1) {
         console.log('用法:');
-        console.log('  node gd-international-downloader.js <搜索关键词> [音源] [音质] [数量]');
+        console.log('  node gd-international-downloader.js <搜索关键词> [音源] [音质] [数量] [镜像]');
         console.log('');
         console.log('示例:');
         console.log('  node gd-international-downloader.js "周杰伦" netease 999 5');
         console.log('  node gd-international-downloader.js "流行音乐" kuwo 320 10');
+        console.log('  node gd-international-downloader.js "周杰伦" netease 999 5 cn   # 手动指定镜像');
         console.log('');
         console.log('支持的音源:');
+        console.log('  镜像: cn / hk / us / default（缺省按音源自动选择，migu/kugou/ximalaya→cn，joox→hk，qobuz/ytmusic→us）');
+        console.log('');
         Object.entries(CONFIG.SOURCES).forEach(([key, info]) => {
             console.log(`  ${key}: ${info.name}`);
         });
@@ -420,6 +445,7 @@ async function main() {
     const source = args[1] || CONFIG.DEFAULT_SOURCE;
     const quality = args[2] || CONFIG.DEFAULT_QUALITY;
     const count = parseInt(args[3]) || 10;
+    const domainArg = args[4] || 'default';
     
     // 验证参数
     if (!CONFIG.SOURCES[source]) {
@@ -432,10 +458,18 @@ async function main() {
         return;
     }
     
-    log(`开始下载: ${query} (${CONFIG.SOURCES[source].name}) - ${quality === '999' ? 'FLAC' : quality + 'kbps'}`, 'info');
+    // 选择域名：手动指定镜像优先，否则按音源自动分流
+    let domain;
+    if (domainArg && domainArg !== 'default' && CONFIG.DOMAINS.MIRRORS[domainArg]) {
+        domain = CONFIG.DOMAINS.MIRRORS[domainArg];
+    } else {
+        domain = domainForSource(source);
+    }
+
+    log(`开始下载: ${query} (${CONFIG.SOURCES[source].name}) - ${quality === '999' ? 'FLAC' : quality + 'kbps'} @ ${domain}`, 'info');
     
     try {
-        const result = await batchDownload(CONFIG.DOMAINS.INTERNATIONAL, query, source, quality, count);
+        const result = await batchDownload(domain, query, source, quality, count);
         
         console.log('\n🎉 下载完成!');
         console.log(`总数量: ${result.total}`);

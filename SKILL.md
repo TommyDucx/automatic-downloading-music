@@ -104,24 +104,37 @@ API 返回 `{songname, artist, album, url, br, size, source, lrc}`；`url` 为�
 python3 flac_metadata_embedder.py --downloads-dir <项目根目录>
 # 单文件：
 python3 flac_metadata_embedder.py --single-file "path/to/song.flac"
+# 可选参数：
+#   --gd-source netease|kuwo|qobuz|joox|migu|ytmusic   刮削音源（默认 netease）
+#   --no-cover                                        不内嵌封面
+#   --no-gdmusic                                      完全不用 GD音乐台 API（跳过封面/翻译/歌词兜底）
 ```
 
 依赖：`brew install flac`（提供 metaflac）+ `pip3 install syncedlyrics requests beautifulsoup4 rapidfuzz soupsieve`。
 
 ### 内嵌的字段（Vorbis 注释）
-`TITLE` `ARTIST` `ALBUM` `ALBUMARTIST` `COMPOSER` `GENRE` `DATE` `TRACKNUMBER` `TOTALTRACKS` `COMMENT` + `LYRICS`
+`TITLE` `ARTIST` `ARTISTS` `ALBUM` `ALBUMARTIST` `COMPOSER` `GENRE` `DATE` `TRACKNUMBER` `TOTALTRACKS` `COMMENT` + `LYRICS` + `LYRICS_TRANSLATED` + **封面（PICTURE 块）**
 
 ### 元数据来源逻辑
 - `TITLE/ARTIST`：从文件名 `歌手 - 歌名.flac` 解析
 - `GENRE`：从文件夹名 StyleTag 映射（Synthwave-Chillwave → "Synthwave, Chillwave" 等）
 - `ALBUM/DATE/COMPOSER`：按歌手查内置专辑表，未命中则 `{歌手} Collection` + 当前年份
 - `TRACKNUMBER`：在 playlist.json 中的序号；未匹配默认 1
-- `LYRICS`：syncedlyrics 搜索，失败换 `https://api.lrc.cx/api/v1/lyrics/single`；**先写 lrc 文件到歌曲文件夹，再读内容内嵌**
+- `LYRICS`：syncedlyrics 搜索，失败换 `https://api.lrc.cx/api/v1/lyrics/single`；再失败走 GD音乐台 `types=lyric` 兜底；**先写 lrc 文件到歌曲文件夹，再读内容内嵌**
+- `LYRICS_TRANSLATED`：GD音乐台 `types=lyric` 返回的 `tlyric` 翻译歌词
+- **封面（PICTURE）**：GD音乐台搜索 -> 取 `pic_id` -> `types=pic`（尺寸 1000/640/500/300 回退）-> 带 Referer 下载 -> `metaflac --import-picture-from` 内嵌
 - 歌词入 Vorbis 注释前需清洗：去掉 `[00:00.00]` 时间戳行与元信息行（`作曲:` `作词:` 等），否则 `--import-tags-from` 会报 malformed vorbis comment
+
+### GD音乐台刮削（封面/翻译歌词）参考实现
+- 接口形态与签名参考 [gdstudio-embeded-service](https://github.com/Azincc/gdstudio-embeded-service)（types=search/pic/lyric、封面尺寸回退、tlyric 翻译、镜像分流）
+- 签名沿用本站实测有效的 crc32 方案：`s = crc32Hex(encodeURIComponent(name 或 id))`，POST 到 `<mirror>/api.php`
+- **镜像分流**（缺省按音源自动选）：migu/kugou/ximalaya → `music-api-cn.gdstudio.xyz`，joox → `music-api-hk.gdstudio.xyz`，qobuz/ytmusic → `music-api-us.gdstudio.xyz`，其余 → `music-api.gdstudio.xyz`
+- 请求失败按 1s,2s,4s,8s... 指数退避重试（上限 30s），符合站点限流口径（约 50 次/5 分钟）
 
 ### 踩坑
 - **不要**用 `--import-tags-from <lrc>` 直接导入歌词（时间戳行非法），要用 `--set-tag "LYRICS=<清洗后文本>"`
 - 文件名非 `歌手 - 歌名` 格式（如纯中文歌名）解析不到歌手/歌名，会跳过 → 手动改名或单独补元数据
+- 封面内嵌前必须 `metaflac --remove --block-type=PICTURE` 清掉旧封面，否则重复堆积
 
 ## 步骤 4：验证
 
@@ -152,6 +165,10 @@ node gd-international-downloader.js "流行音乐" kuwo 320 10
 
 # 批量下载歌单（自动跳过已存在文件）
 node gd-international-downloader.js "治愈系合成器" netease 999 20
+
+# 手动指定镜像（cn/hk/us/default；缺省按音源自动分流）
+#   migu/kugou/ximalaya→cn，joox→hk，qobuz/ytmusic→us
+node gd-international-downloader.js "周杰伦" netease 999 5 cn
 ```
 
 ### 元数据内嵌

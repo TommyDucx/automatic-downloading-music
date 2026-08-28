@@ -1,26 +1,285 @@
 #!/usr/bin/env python3
 """
 FLAC 文件元数据内嵌工具
-支持：歌词、歌手、专辑、风格、年份、封面图片等
+支持：歌词、歌手、专辑、风格、年份、封面图片、翻译歌词等
+
+参考实现（GD音乐台 API 刮削）：
+- github.com/Azincc/gdstudio-embeded-service 的 internal/service/gdstudio/client.go
+  （types=search/url/pic/lyric、封面尺寸回退、tlyric 翻译、镜像分流 cn/hk/us、指数退避）
+- 签名沿用本技能 gd-international-downloader.js 实测有效的 crc32 方案：
+  s = crc32Hex(encodeURIComponent(name 或 id))，POST x-www-form-urlencoded 到 <mirror>/api.php
 """
 
 import os
+import sys
 import json
+import time
 import argparse
 import subprocess
+import tempfile
+import urllib.parse
 import requests
 from pathlib import Path
 from datetime import datetime
 
+# metaflac 在非 UTF-8 locale（如 DSH 沙箱默认的 C locale）下会把标签里的非 ASCII
+# 字节替换成 '#'/'?'，导致中文标签损坏。强制 UTF-8 locale 使写入恒为 UTF-8。
+METAFLAC_ENV = {**os.environ, 'LC_ALL': 'en_US.UTF-8', 'LANG': 'en_US.UTF-8'}
+
+
+class GDMusicClient:
+    """GD音乐台 API 客户端：搜索 / 封面 pic / 歌词 lyric
+
+    签名方案（与 gd-international-downloader.js 一致，本站实测有效）：
+      s = crc32Hex(encodeURIComponent(name 或 id))
+    镜像分流（参考 gdstudio-embeded-service config.yaml）：
+      migu/kugou/ximalaya -> cn，joox -> hk，qobuz/ytmusic -> us，其余默认
+    限流口径：约 50 次/5 分钟，请求间隔由外层控制；失败按 1s,2s,4s,8s... 指数退避（上限 30s）。
+    """
+
+    DOMAINS = {
+        "default": "music-api.gdstudio.xyz",
+        "cn": "music-api-cn.gdstudio.xyz",
+        "hk": "music-api-hk.gdstudio.xyz",
+        "us": "music-api-us.gdstudio.xyz",
+    }
+    MIRROR_BY_SOURCE = {
+        "migu": "cn", "kugou": "cn", "ximalaya": "cn",
+        "joox": "hk",
+        "qobuz": "us", "ytmusic": "us",
+    }
+    COVER_SIZES = (1000, 640, 500, 300)
+    COVER_REFERERS = {
+        "netease": "https://music.163.com/",
+        "qq": "https://y.qq.com/",
+        "kuwo": "https://www.kuwo.cn/",
+    }
+
+    def __init__(self, source="netease", timeout=15, max_retries=4):
+        self.source = source
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        })
+
+    # ------------------------------------------------------------------ 签名
+    @staticmethod
+    def _crc32(data: bytes) -> int:
+        """标准 CRC32（与 gd-international-downloader.js 的 crc32() 一致）"""
+        poly = 0xEDB88320
+        crc = 0xFFFFFFFF
+        for b in data:
+            crc ^= b
+            for _ in range(8):
+                if crc & 1:
+                    crc = (crc >> 1) ^ poly
+                else:
+                    crc >>= 1
+        return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+
+    @staticmethod
+    def js_encode_uri_component(value) -> str:
+        """等价于 JS encodeURIComponent（不编码 !~*'() ）"""
+        return urllib.parse.quote(str(value), safe="!~*'()")
+
+    def sign(self, value) -> str:
+        return f"{self._crc32(self.js_encode_uri_component(value).encode('utf-8')):08X}"
+
+    # ------------------------------------------------------------------ 请求
+    def mirror_for(self, source=None) -> str:
+        src = (source or self.source or "").lower()
+        return self.DOMAINS.get(self.MIRROR_BY_SOURCE.get(src, "default"), self.DOMAINS["default"])
+
+    def api_call(self, params, source=None, depth=0):
+        """POST form 到 <mirror>/api.php，附 crc32 签名；401/网络错误指数退避重试"""
+        src = source or self.source
+        domain = self.mirror_for(src)
+        parts = []
+        for k, v in params.items():
+            if v is None or v == "":
+                continue
+            parts.append(f"{k}={urllib.parse.quote(str(v), safe='')}")
+        sign_input = params.get("name") or params.get("id") or ""
+        parts.append(f"s={self.sign(sign_input)}")
+        url = f"https://{domain}/api.php"
+
+        def wait_backoff():
+            if depth < self.max_retries:
+                time.sleep(min(2 ** depth, 30))
+
+        try:
+            resp = self.session.post(url, data="&".join(parts), timeout=self.timeout)
+        except requests.RequestException:
+            if depth < self.max_retries:
+                wait_backoff()
+                return self.api_call(params, source, depth + 1)
+            raise
+
+        if resp.status_code == 401 or (resp.status_code == 200 and "Invalid request" in resp.text[:200]):
+            # 签名失败/限流，冷却后重试
+            if depth < self.max_retries:
+                wait_backoff()
+                return self.api_call(params, source, depth + 1)
+
+        try:
+            return resp.json()
+        except ValueError:
+            return {"raw": resp.text}
+
+    # ------------------------------------------------------------------ 业务
+    def search(self, query, source=None, count=20):
+        """types=search -> 结果列表（数组）"""
+        result = self.api_call({
+            "types": "search",
+            "source": source or self.source,
+            "name": query,
+            "count": count,
+            "pages": 1,
+        }, source)
+        return result if isinstance(result, list) else []
+
+    def cover_url(self, pic_id, source=None, sizes=COVER_SIZES):
+        """types=pic -> 封面 URL（按尺寸回退尝试，参考 gdstudio-embeded-service）"""
+        for size in sizes:
+            result = self.api_call({
+                "types": "pic",
+                "source": source or self.source,
+                "id": pic_id,
+                "size": size,
+            }, source)
+            if isinstance(result, dict):
+                url = result.get("url")
+                if url and url != "err":
+                    return url
+        return None
+
+    def lyric(self, lyric_id, source=None):
+        """types=lyric -> {lyric, tlyric}（tlyric 为翻译歌词）"""
+        result = self.api_call({
+            "types": "lyric",
+            "source": source or self.source,
+            "id": lyric_id,
+        }, source)
+        if isinstance(result, dict):
+            return {"lyric": result.get("lyric", ""), "tlyric": result.get("tlyric", "")}
+        return {"lyric": "", "tlyric": ""}
+
+    def download_cover(self, cover_url, source=None):
+        """下载封面字节；按源带 Referer（163/qq/kuwo），避免 CDN 403"""
+        referer = self.COVER_REFERERS.get((source or self.source or "").lower(), "")
+        headers = {"Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"}
+        if referer:
+            headers["Referer"] = referer
+        try:
+            resp = requests.get(cover_url, headers=headers, timeout=self.timeout)
+            if resp.status_code == 200 and resp.content:
+                return resp.content
+        except requests.RequestException:
+            pass
+        return None
+
+    # ------------------------------------------------------------------ 匹配
+    @staticmethod
+    def _split_artists(value):
+        for sep in (" / ", "、", ";", ",", "/"):
+            value = value.replace(sep, "|")
+        return [p.strip() for p in value.split("|") if p.strip()]
+
+    @staticmethod
+    def _norm_key(value):
+        return " ".join(
+            value.replace("’", "'").replace("‘", "'").replace("\x60", "'").replace("＇", "'").lower().split()
+        )
+
+    @staticmethod
+    def _to_str(v):
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v.strip()
+        if isinstance(v, (list, tuple)):
+            names = []
+            for item in v:
+                if isinstance(item, dict):
+                    names.append(str(item.get("name") or item.get("artistName") or "").strip())
+                else:
+                    names.append(str(item).strip())
+            return " / ".join(n for n in names if n)
+        if isinstance(v, dict):
+            return str(v.get("name") or v.get("artistName") or "").strip()
+        return str(v).strip()
+
+    def pick_metadata(self, items, title, artist):
+        """从搜索结果挑出可信条目：曲名等值 + 歌手部分匹配优先，其次兜底取带 id 的条目。
+        参考 gdstudio-embeded-service 的 pickMetadata / TAG_MATCHING_LOGIC.md。
+        返回 dict(TrackID/Title/Artist/Album/PicID/LyricID) 或 None。
+        """
+        if not items:
+            return None
+        norm_title = self._norm_key(title or "")
+        norm_artist = self._norm_key(artist or "")
+
+        def make(item):
+            pic_id = self._to_str(item.get("pic_id")) or self._to_str(item.get("picid"))
+            lyric_id = self._to_str(item.get("lyric_id")) or self._to_str(item.get("lyricid"))
+            return {
+                "TrackID": self._to_str(item.get("id")),
+                "Title": self._to_str(item.get("name")) or self._to_str(item.get("title")),
+                "Artist": self._to_str(item.get("artist")),
+                "Album": self._to_str(item.get("album")),
+                "PicID": pic_id,
+                "LyricID": lyric_id,
+            }
+
+        # 1) 曲名等值 + 歌手部分匹配（最强信号，避免同名翻唱/串曲）
+        if norm_title:
+            for item in items:
+                m = make(item)
+                if self._norm_key(m["Title"]) != norm_title:
+                    continue
+                if norm_artist:
+                    item_artists = [self._norm_key(a) for a in self._split_artists(m["Artist"])]
+                    expected = self._split_artists(norm_artist)
+                    hit = any(
+                        ea == ia or ea in ia or ia in ea
+                        for ea in expected for ia in item_artists
+                    )
+                    if not hit:
+                        continue
+                return m
+        # 2) 兜底：取第一条带 id 的搜索结果（目标源条目本身）
+        for item in items:
+            m = make(item)
+            if m["TrackID"]:
+                return m
+        return None
+
+
+
 class FLACMetadataEmbedder:
-    def __init__(self, downloads_dir):
+    def __init__(self, downloads_dir, gd_source="netease", use_gdmusic=True, embed_cover=True):
         self.downloads_dir = Path(downloads_dir)
-        
+        self.gd_source = gd_source
+        self.use_gdmusic = use_gdmusic
+        self.embed_cover = embed_cover
+        self._gd = None
+
+    @property
+    def gd(self):
+        if self._gd is None:
+            self._gd = GDMusicClient(source=self.gd_source)
+        return self._gd
+
     def safe_filename(self, text):
         """生成安全的文件名"""
         import re
         return re.sub(r'[\\/*?:"<>|]', "", text).strip()
-    
+
     def download_lyrics(self, title, artist, save_dir=None):
         """下载同步歌词，保存到歌曲所在文件夹
         save_dir: 歌词保存目录（缺省为歌曲所在文件夹）
@@ -32,10 +291,10 @@ class FLACMetadataEmbedder:
             print("syncedlyrics 未安装，正在安装...")
             subprocess.run([sys.executable, "-m", "pip", "install", "syncedlyrics"])
             import syncedlyrics
-        
+
         query = f"{title} {artist}"
         lrc_content = syncedlyrics.search(query)
-        
+
         if not lrc_content:
             # 尝备用API
             try:
@@ -48,7 +307,7 @@ class FLACMetadataEmbedder:
                     lrc_content = resp.text
             except:
                 pass
-        
+
         if lrc_content:
             fn = self.safe_filename(f"{artist}-{title}.lrc")
             full_path = save_dir / fn if save_dir else self.downloads_dir / fn
@@ -57,7 +316,61 @@ class FLACMetadataEmbedder:
                 f.write(lrc_content)
             return str(full_path)
         return None
-    
+
+
+    def download_gd_lyrics(self, title, artist, save_dir=None):
+        """GD音乐台歌词兜底：搜索 -> 取 lyric_id -> types=lyric（含 tlyric 翻译）
+        返回 (lrc_path, translation)；失败返回 (None, None)
+        """
+        if not self.use_gdmusic:
+            return None, None
+        try:
+            items = self.gd.search(f"{title} {artist}", count=20)
+            meta = self.gd.pick_metadata(items, title, artist)
+            if not meta or not meta.get("LyricID"):
+                return None, None
+            data = self.gd.lyric(meta["LyricID"])
+            lrc = (data.get("lyric") or "").strip()
+            if not lrc:
+                return None, None
+            save_dir = Path(save_dir) if save_dir else self.downloads_dir
+            save_dir.mkdir(parents=True, exist_ok=True)
+            fn = self.safe_filename(f"{artist}-{title}.lrc")
+            path = save_dir / fn
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(lrc)
+            translation = (data.get("tlyric") or "").strip()
+            return str(path), (translation or None)
+        except Exception as e:
+            print(f"⚠️ GD音乐台歌词获取失败（{title} - {artist}）: {e}")
+            return None, None
+
+    def resolve_cover(self, title, artist):
+        """解析并下载封面：搜索 -> pick pic_id -> types=pic（尺寸回退）-> 下载字节
+        返回封面字节或 None
+        """
+        if not self.use_gdmusic or not self.embed_cover:
+            return None
+        try:
+            items = self.gd.search(f"{title} {artist}", count=20)
+            meta = self.gd.pick_metadata(items, title, artist)
+            if not meta or not meta.get("PicID"):
+                print(f"⚠️ 未找到封面（{title} - {artist}）")
+                return None
+            url = self.gd.cover_url(meta["PicID"])
+            if not url:
+                print(f"⚠️ 封面 URL 获取失败（{title} - {artist}）")
+                return None
+            data = self.gd.download_cover(url)
+            if not data:
+                print(f"⚠️ 封面下载失败（{title} - {artist}）")
+                return None
+            return data
+        except Exception as e:
+            print(f"⚠️ 封面解析异常（{title} - {artist}）: {e}")
+            return None
+
+
     def get_metadata_from_filename(self, filename):
         """从文件名解析歌手和歌名"""
         # 处理格式：歌手 - 歌名.flac
@@ -66,7 +379,7 @@ class FLACMetadataEmbedder:
             if len(parts) == 2:
                 return parts[0].strip(), parts[1].strip()
         return None, None
-    
+
     def get_genre_from_folder(self, folder_name):
         """根据文件夹名获取风格"""
         genre_mapping = {
@@ -77,12 +390,12 @@ class FLACMetadataEmbedder:
             "Space-Ambient-Modular-Synth": "Space, Ambient, Modular Synth",
             "Emotional-Synth-Melancholy": "Emotional Synth, Melancholy"
         }
-        
+
         for key, genre in genre_mapping.items():
             if key in folder_name:
                 return genre
         return "Electronic"
-    
+
     def get_album_info(self, artist, genre):
         """根据歌手和风格获取专辑信息"""
         album_info = {
@@ -117,20 +430,77 @@ class FLACMetadataEmbedder:
                 "albumartist": "Nujabes"
             }
         }
-        
+
         return album_info.get(artist, {
             "album": f"{artist} Collection",
             "year": str(datetime.now().year),
             "composer": artist,
             "albumartist": artist
         })
-    
+
+
+    @staticmethod
+    def _clean_lyrics_for_tag(lyrics_content, max_len=5000):
+        """清理歌词为适合 Vorbis 注释的纯文本（剥离 LRC 时间戳与元信息，保留歌词文本）"""
+        cleaned = []
+        for line in lyrics_content.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            # LRC 行形如 "[00:29.30] 故事的小黃花" 或 "[ti:歌名]"：
+            # 剥离所有 [..] 前缀（时间戳与元信息标签），保留其后歌词文本
+            while line.startswith('['):
+                end = line.find(']')
+                if end < 0:
+                    line = ''
+                    break
+                line = line[end + 1:].strip()
+            if not line:
+                continue
+            if line.startswith('<'):
+                continue
+            if any(line.startswith(k) for k in ("作曲:", "作词:", "编曲:", "制作人:", "演唱:")):
+                continue
+            cleaned.append(line)
+        if not cleaned:
+            return ""
+        text = ' '.join(cleaned)
+        return text[:max_len]
+
     def embed_metadata(self, flac_path, metadata):
-        """使用 metaflac 内嵌元数据"""
+        """使用 metaflac 内嵌元数据（封面先处理，标签最后写，避免 PICTURE 重写影响标签）"""
         try:
-            # 构建元数据命令（不直接导入歌词文件，避免格式问题）
+            flac_path = str(flac_path)
+
+            # 封面内嵌（先清旧 PICTURE 再导入；此步会重写文件，故标签放到最后再写）
+            cover_data = metadata.get("cover_data")
+            if cover_data:
+                cover_tmp = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
+                        tf.write(cover_data)
+                        cover_tmp = tf.name
+                    r1 = subprocess.run(
+                        ['metaflac', '--remove', '--block-type=PICTURE', flac_path],
+                        capture_output=True, text=True, env=METAFLAC_ENV
+                    )
+                    r2 = subprocess.run(
+                        ['metaflac', f'--import-picture-from={cover_tmp}', flac_path],
+                        capture_output=True, text=True, env=METAFLAC_ENV
+                    )
+                    if r1.returncode != 0 or r2.returncode != 0:
+                        print(f"⚠️ 封面内嵌失败: {flac_path}")
+                        print(f"   metaflac: {r2.stderr or r1.stderr}")
+                finally:
+                    if cover_tmp:
+                        try:
+                            os.unlink(cover_tmp)
+                        except OSError:
+                            pass
+
+            # 先清空旧标签，避免重复值堆积（PICTURE 块单独处理）
             cmd = ['metaflac', '--remove-all-tags', flac_path]
-            
+
             # 添加标签
             tags = [
                 f'TITLE={metadata.get("title", "")}',
@@ -144,168 +514,67 @@ class FLACMetadataEmbedder:
                 f'TOTALTRACKS={metadata.get("totaltracks", "")}',
                 f'COMMENT={metadata.get("comment", "")}'
             ]
-            
-            # 如果有歌词，单独处理
+
+            # 多值艺术家标签（参考 gdstudio-embeded-service tagger）
+            artist = metadata.get("artist", "")
+            if artist:
+                tags.append(f'ARTISTS={artist}')
+
+            # 歌词
             if metadata.get('lyrics'):
-                # 将歌词转换为适合Vorbis注释的格式
-                lyrics_content = metadata['lyrics']
-                # 清理歌词格式，移除时间戳行，只保留文本
-                cleaned_lyrics = []
-                for line in lyrics_content.split('\n'):
-                    line = line.strip()
-                    if line and not line.startswith('[') and not line.startswith('<'):
-                        cleaned_lyrics.append(line)
-                
+                cleaned_lyrics = self._clean_lyrics_for_tag(metadata['lyrics'])
                 if cleaned_lyrics:
-                    # 合并歌词行，用空格分隔
-                    lyrics_text = ' '.join(cleaned_lyrics)
-                    # 截取前5000字符避免过长
-                    lyrics_text = lyrics_text[:5000]
-                    tags.append(f'LYRICS={lyrics_text}')
-            
+                    tags.append(f'LYRICS={cleaned_lyrics}')
+
+            # 翻译歌词
+            if metadata.get('translation'):
+                cleaned_trans = self._clean_lyrics_for_tag(metadata['translation'])
+                if cleaned_trans:
+                    tags.append(f'LYRICS_TRANSLATED={cleaned_trans}')
+
             # 添加所有标签
             for tag in tags:
                 cmd.extend(['--set-tag', tag])
-            
-            # 执行命令
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                print(f"✅ 元数据已内嵌: {flac_path}")
-                return True
-            else:
+
+            # 执行命令（强制 UTF-8 locale，避免 C locale 下中文标签被替换为 #/?）
+            result = subprocess.run(cmd, capture_output=True, text=True, env=METAFLAC_ENV)
+
+            if result.returncode != 0:
                 print(f"❌ 元数据内嵌失败: {flac_path}")
                 print(f"错误: {result.stderr}")
                 return False
-                
+
+            print(f"✅ 元数据已内嵌: {flac_path}"
+                  + ("（含封面）" if cover_data else "")
+                  + ("（含翻译歌词）" if metadata.get('translation') else ""))
+            return True
+
         except Exception as e:
             print(f"❌ 元数据内嵌异常: {flac_path}")
             print(f"错误: {e}")
             return False
-    
-    def process_all_files(self):
-        """处理所有FLAC文件"""
-        print("开始处理FLAC文件元数据...")
-        
-        total_files = 0
-        processed_files = 0
-        failed_files = 0
-        
-        # 遍历所有文件夹
-        for folder in self.downloads_dir.glob("downloads/0*"):
-            if not folder.is_dir():
-                continue
-                
-            folder_name = folder.name
-            genre = self.get_genre_from_folder(folder_name)
-            
-            # 读取歌单
-            playlist_path = folder / "playlist.json"
-            if playlist_path.exists():
-                with open(playlist_path, 'r', encoding='utf-8') as f:
-                    playlist = json.load(f)
-            else:
-                playlist = []
-            
-            # 处理FLAC文件
-            for flac_file in folder.glob("*.flac"):
-                total_files += 1
-                
-                # 从文件名解析歌手和歌名
-                artist, title = self.get_metadata_from_filename(flac_file.name)
-                
-                if not artist or not title:
-                    print(f"⚠️ 无法解析文件名: {flac_file.name}")
-                    failed_files += 1
-                    continue
-                
-                # 获取专辑信息
-                album_info = self.get_album_info(artist, genre)
-                
-                # 下载歌词（保存到歌曲所在文件夹）
-                lyrics_path = self.download_lyrics(title, artist, save_dir=folder)
-                lyrics_content = None
-                if lyrics_path:
-                    with open(lyrics_path, 'r', encoding='utf-8') as f:
-                        lyrics_content = f.read()
-                
-                # 构建元数据
-                metadata = {
-                    'title': title,
-                    'artist': artist,
-                    'album': album_info['album'],
-                    'albumartist': album_info['albumartist'],
-                    'composer': album_info['composer'],
-                    'genre': genre,
-                    'year': album_info['year'],
-                    'track': '1',  # 默认为1，避免匹配问题
-                    'totaltracks': str(len(playlist)),
-                    'comment': f'Genre: {genre} | Source: music.gdstudio.org',
-                    'lyrics': lyrics_content
-                }
-                
-                # 内嵌元数据
-                if self.embed_metadata(flac_file, metadata):
-                    processed_files += 1
-                else:
-                    failed_files += 1
-        
-        print(f"\n处理完成:")
-        print(f"总文件数: {total_files}")
-        print(f"成功处理: {processed_files}")
-        print(f"处理失败: {failed_files}")
-        
-        return processed_files, failed_files
 
-def main():
-    parser = argparse.ArgumentParser(description='FLAC文件元数据内嵌工具')
-    parser.add_argument('--downloads-dir', default='/Users/tommydu/Documents/automatic downloading music', 
-                       help='下载目录路径')
-    parser.add_argument('--single-file', help='处理单个文件')
-    parser.add_argument('--list-genres', action='store_true', help='列出所有风格')
-    
-    args = parser.parse_args()
-    
-    # 检查依赖
-    try:
-        import metaflac
-    except ImportError:
-        print("正在安装 metaflac...")
-        if os.name == 'posix':
-            subprocess.run(['brew', 'install', 'flac'])
-        else:
-            print("请手动安装 FLAC 工具: https://xiph.org/flac/")
-    
-    embedder = FLACMetadataEmbedder(args.downloads_dir)
-    
-    if args.list_genres:
-        print("支持的风格:")
-        for genre in embedder.get_genre_from_folder("test").split(", "):
-            print(f"  - {genre}")
-        return
-    
-    if args.single_file:
-        # 处理单个文件
-        flac_path = Path(args.single_file)
-        if not flac_path.exists():
-            print(f"文件不存在: {flac_path}")
-            return
-        
-        artist, title = embedder.get_metadata_from_filename(flac_path.name)
-        if not artist or not title:
-            print(f"无法解析文件名: {flac_path.name}")
-            return
-        
-        genre = "Electronic"  # 默认
-        album_info = embedder.get_album_info(artist, genre)
-        
-        lyrics_path = embedder.download_lyrics(title, artist, save_dir=flac_path.parent)
+
+    def _build_metadata(self, flac_file, folder, playlist, genre, album_info, title, artist):
+        """构建并补全元数据（歌词 / 翻译 / 封面），返回 metadata dict"""
+        # 下载歌词（保存到歌曲所在文件夹）
+        lyrics_path = self.download_lyrics(title, artist, save_dir=folder)
         lyrics_content = None
+        translation = None
         if lyrics_path:
             with open(lyrics_path, 'r', encoding='utf-8') as f:
                 lyrics_content = f.read()
-        
-        metadata = {
+        else:
+            # GD音乐台歌词兜底（含翻译）
+            gd_path, translation = self.download_gd_lyrics(title, artist, save_dir=folder)
+            if gd_path:
+                with open(gd_path, 'r', encoding='utf-8') as f:
+                    lyrics_content = f.read()
+
+        # 封面
+        cover_data = self.resolve_cover(title, artist)
+
+        return {
             'title': title,
             'artist': artist,
             'album': album_info['album'],
@@ -313,17 +582,131 @@ def main():
             'composer': album_info['composer'],
             'genre': genre,
             'year': album_info['year'],
-            'track': '1',
-            'totaltracks': '1',
+            'track': '1',  # 默认为1，避免匹配问题
+            'totaltracks': str(len(playlist)),
             'comment': f'Genre: {genre} | Source: music.gdstudio.org',
-            'lyrics': lyrics_content
+            'lyrics': lyrics_content,
+            'translation': translation,
+            'cover_data': cover_data,
         }
-        
+
+    def process_all_files(self):
+        """处理所有FLAC文件"""
+        print("开始处理FLAC文件元数据...")
+
+        total_files = 0
+        processed_files = 0
+        failed_files = 0
+
+        # 遍历所有文件夹
+        for folder in self.downloads_dir.glob("downloads/0*"):
+            if not folder.is_dir():
+                continue
+
+            folder_name = folder.name
+            genre = self.get_genre_from_folder(folder_name)
+
+            # 读取歌单
+            playlist_path = folder / "playlist.json"
+            if playlist_path.exists():
+                with open(playlist_path, 'r', encoding='utf-8') as f:
+                    playlist = json.load(f)
+            else:
+                playlist = []
+
+            # 处理FLAC文件
+            for flac_file in folder.glob("*.flac"):
+                total_files += 1
+
+                # 从文件名解析歌手和歌名
+                artist, title = self.get_metadata_from_filename(flac_file.name)
+
+                if not artist or not title:
+                    print(f"⚠️ 无法解析文件名: {flac_file.name}")
+                    failed_files += 1
+                    continue
+
+                # 获取专辑信息
+                album_info = self.get_album_info(artist, genre)
+
+                metadata = self._build_metadata(flac_file, folder, playlist, genre, album_info, title, artist)
+
+                # 内嵌元数据
+                if self.embed_metadata(flac_file, metadata):
+                    processed_files += 1
+                else:
+                    failed_files += 1
+
+        print(f"\n处理完成:")
+        print(f"总文件数: {total_files}")
+        print(f"成功处理: {processed_files}")
+        print(f"处理失败: {failed_files}")
+
+        return processed_files, failed_files
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description='FLAC文件元数据内嵌工具')
+    parser.add_argument('--downloads-dir', default='/Users/tommydu/Documents/automatic downloading music',
+                       help='下载目录路径')
+    parser.add_argument('--single-file', help='处理单个文件')
+    parser.add_argument('--list-genres', action='store_true', help='列出所有风格')
+    parser.add_argument('--gd-source', default='netease',
+                       help='GD音乐台刮削音源（netease/kuwo/qobuz/joox/migu/ytmusic 等，默认 netease）')
+    parser.add_argument('--no-gdmusic', action='store_true',
+                       help='不使用 GD音乐台 API（跳过封面/翻译歌词/歌词兜底）')
+    parser.add_argument('--no-cover', action='store_true',
+                       help='不内嵌封面')
+
+    args = parser.parse_args()
+
+    # 检查 metaflac 依赖
+    if subprocess.run(['which', 'metaflac'], capture_output=True).returncode != 0:
+        print("metaflac 未安装，正在安装...")
+        if os.name == 'posix':
+            subprocess.run(['brew', 'install', 'flac'])
+        else:
+            print("请手动安装 FLAC 工具: https://xiph.org/flac/")
+
+    embedder = FLACMetadataEmbedder(
+        args.downloads_dir,
+        gd_source=args.gd_source,
+        use_gdmusic=not args.no_gdmusic,
+        embed_cover=not args.no_cover,
+    )
+
+    if args.list_genres:
+        print("支持的风格:")
+        for genre in embedder.get_genre_from_folder("test").split(", "):
+            print(f"  - {genre}")
+        return
+
+    if args.single_file:
+        # 处理单个文件
+        flac_path = Path(args.single_file)
+        if not flac_path.exists():
+            print(f"文件不存在: {flac_path}")
+            return
+
+        artist, title = embedder.get_metadata_from_filename(flac_path.name)
+        if not artist or not title:
+            print(f"无法解析文件名: {flac_path.name}")
+            return
+
+        genre = "Electronic"  # 默认
+        album_info = embedder.get_album_info(artist, genre)
+
+        metadata = embedder._build_metadata(
+            flac_path, flac_path.parent, [], genre, album_info, title, artist
+        )
+        metadata['totaltracks'] = '1'
+
         embedder.embed_metadata(flac_path, metadata)
     else:
         # 处理所有文件
         embedder.process_all_files()
 
+
 if __name__ == "__main__":
-    import sys
     main()

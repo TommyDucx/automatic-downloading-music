@@ -10,7 +10,9 @@
 - 🔍 **多音源**：netease、joox、tencent、kuwo、qobuz、migu 等
 - 🎼 **智能匹配**：模糊匹配歌手/歌名，避免翻唱、Live、Remix 等干扰项
 - 📝 **歌词同步**：自动下载同步 LRC 歌词并内嵌，歌词与歌曲同文件夹
-- 🏷️ **元数据完整**：内嵌 TITLE、ARTIST、ALBUM、GENRE、DATE、LYRICS 等
+- 🖼️ **封面内嵌**：从 GD音乐台自动解析封面（pic_id + 尺寸回退 + Referer）并写入 FLAC PICTURE 块
+- 🌐 **翻译歌词**：写入 LYRICS_TRANSLATED（GD音乐台 tlyric）
+- 🏷️ **元数据完整**：内嵌 TITLE、ARTIST、ARTISTS、ALBUM、GENRE、DATE、LYRICS、LYRICS_TRANSLATED、封面等
 - 🚀 **防限流**：随机抖动延迟 + 401 冷却重试 + 深度上限，避免触发站点限制
 - 📁 **自动分类**：按音乐风格自动分文件夹管理
 - 🔄 **断点续传**：已存在文件自动跳过，不消耗 API 配额
@@ -103,6 +105,8 @@ node gd-international-downloader.js "流行音乐" kuwo 320 10
 - **签名**：对 `encodeURIComponent(name)` 求自定义 crc32，取后 8 位大写
 - **音质优先级**：按 `br` 排序（999=FLAC），支持 `--fallback` 降级
 - **国际版** `music-api.gdstudio.xyz`：同样基于 CRC32 签名，支持网易云音乐、酷我音乐
+- **镜像分流**（国际版）：migu/kugou/ximalaya→`music-api-cn.gdstudio.xyz`，joox→`music-api-hk.gdstudio.xyz`，qobuz/ytmusic→`music-api-us.gdstudio.xyz`，可手动第 5 参数指定
+- **刮削接口**：`types=search / url / pic / lyric`（pic 封面尺寸 1000/640/500/300 回退，lyric 含 tlyric 翻译），失败指数退避（1s,2s,4s…上限 30s）
 
 ## 歌词存放规则
 
@@ -115,6 +119,7 @@ node gd-international-downloader.js "流行音乐" kuwo 320 10
 | 搜索返回 `401 Invalid request` | 站点限流，kill 进程 → 等待冷却 → 用更大 `--delay` 续跑（断点续传） |
 | 无法找到匹配曲目 | 歌单用真实歌手/曲名，去掉 `(Instrumental)` 等不存在的版本后缀 |
 | 元数据内嵌失败 | `brew install flac` 提供 metaflac；文件名需为 `歌手 - 歌名.flac` |
+| 封面/翻译获取失败 | 属可降级项，不影响下载与歌词；可 `--no-cover` / `--no-gdmusic` 关闭，或换 `--gd-source`（如 kuwo） |
 
 ## 版权提醒
 
