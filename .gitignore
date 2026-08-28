@@ -1,0 +1,24 @@
+# 缓存
+.gd-flac-cache/
+
+# 下载的音乐文件
+*.mp3
+*.flac
+*.wav
+*.m4a
+*.ogg
+*.lrc
+
+# 下载目录
+downloads/
+downloads_international/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# 日志
+*.log
