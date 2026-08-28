@@ -74,6 +74,18 @@ node gd-flac-downloader.js --list <playlist.json> --out <歌曲文件夹> \
 
 驱动脚本 `run_all.sh` 顺序遍历 `downloads/0*/playlist.json` 逐个文件夹下载，日志写 `/tmp/gdmusic_batch.log`。
 
+### 国际版批量下载（gd-international-downloader.js）
+按关键词搜索下载（网易云 / 酷我），自动跳过已存在文件：
+
+```bash
+node gd-international-downloader.js "周杰伦" netease 999 5        # 网易云 FLAC
+node gd-international-downloader.js "流行音乐" kuwo 320 10        # 酷我 320k
+node gd-international-downloader.js "周杰伦" netease 999 5 cn     # 手动指定镜像
+```
+
+参数：`<关键词> [音源 netease|kuwo] [音质 128|192|320|999] [数量] [镜像 cn|hk|us|default]`
+镜像缺省按音源自动分流：migu/kugou/ximalaya→cn，joox→hk，qobuz/ytmusic→us，其余→默认。
+
 ### 防限流关键（务必遵守）
 站点对连续大量请求会临时限流，症状：
 - 搜索返回 `401 {"detail":"Invalid request."}`
@@ -86,15 +98,16 @@ node gd-flac-downloader.js --list <playlist.json> --out <歌曲文件夹> \
 4. 触发限流后：kill 进程 → 等冷却 → 以更大 delay 续跑（已存在文件自动跳过 = 断点续传）
 
 ### 网络拓扑
-- **主站**: `https://music.gdstudio.org` ✅ 完全支持
-- **国际版**: `https://music.gdstudio.xyz` ❌ 暂不支持（API 结构不同，需逆向工程）
+- **主站**: `https://music.gdstudio.org` ✅ 完全支持（`gd-flac-downloader.js`）
+- **国际版**: `https://music-api.gdstudio.xyz` ✅ 完全支持（`gd-international-downloader.js`，含 cn/hk/us 镜像）
 
 主站签名：`/time` 拿时间戳 → VM 跑 `crc32.min.js` 对 `encodeURIComponent(name)` 求 crc32 → 拼 `s=` 参数
 POST `/api.php`，`Content-Type: application/x-www-form-urlencoded`，需 UA / X-Requested-With 头
 API 返回 `{songname, artist, album, url, br, size, source, lrc}`；`url` 为需二次请求的真实下载地址
 下载音质优先级按 `br` 排序（999=FLAC，越高越好），`--fallback` 时无无损也可降级 MP3
 
-**注意**：国际版使用不同的 API 结构，暂不支持。如需支持国际版，需逆向工程其认证机制。
+国际版签名：`s = crc32Hex(encodeURIComponent(name 或 id))`，POST form 到 `<mirror>/api.php`；
+限流口径约 50 次/5 分钟，遇 401 自动指数退避重试。
 
 ## 步骤 3：内嵌元数据
 

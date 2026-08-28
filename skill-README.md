@@ -51,91 +51,65 @@ cd ~/music-processing-skills
 
 ```
 music-processing-skills/
-├── README.md                    # 技能说明文档
-├── music_downloader.py         # 主下载脚本
-├── metadata_embedder.py         # 元数据内嵌工具
-├── batch_runner.sh              # 批量运行脚本
-├── config.json                  # 配置文件
-├── requirements.txt             # Python依赖
-└── examples/                    # 示例文件
-    ├── sample_playlists/
-    └── output_example/
+├── SKILL.md                       # 技能说明（完整工作流，主文档）
+├── gd-flac-downloader.js          # 主站下载器（Node 零依赖，music.gdstudio.org）
+├── gd-international-downloader.js # 国际版下载器（music-api.gdstudio.xyz + cn/hk/us 镜像）
+├── flac_metadata_embedder.py      # 元数据+歌词+封面+翻译 内嵌（Python + metaflac）
+├── run_all.sh                     # 批量下载驱动（顺序遍历 downloads/0*）
+├── retry_failed.sh                # 失败重试脚本
+├── test_*.js                      # API 逆向测试脚本
+├── .gd-flac-cache/                # 签名运行时缓存（crc32.min.js / player.js 自动下载）
+└── README.md                      # 项目说明
 ```
 
 ## 使用方法
 
-### 快速开始
+### 快速开始（真实脚本）
 ```bash
-# 1. 克隆技能到本地
-cd ~/music-processing-skills
+# 1. 批量下载（主站，歌单驱动，多音源自动防限流）
+node gd-flac-downloader.js --list playlist.json --out "downloads/01-风格目录" \
+  --sources netease,joox --delay 4 --fallback
 
-# 2. 配置音乐风格和歌单
-cp config.json.example config.json
-# 编辑config.json，设置你的音乐风格和歌单
+# 2. 批量下载（国际版，关键词驱动）
+node gd-international-downloader.js "周杰伦" netease 999 5
 
-# 3. 运行批量下载
-chmod +x batch_runner.sh
-./batch_runner.sh
-
-# 4. 内嵌元数据
-python3 metadata_embedder.py
+# 3. 内嵌元数据 + 歌词 + 封面 + 翻译
+python3 flac_metadata_embedder.py --downloads-dir <项目根目录>
+# 单文件：
+python3 flac_metadata_embedder.py --single-file "path/to/song.flac"
 ```
 
 ### 详细步骤
 
-#### 步骤1: 配置音乐风格和歌单
-编辑 `config.json` 文件：
+#### 步骤1: 准备歌单
+每个风格文件夹放一个 `playlist.json`（数组，元素 `{"title": "...", "artist": "..."}`，必须用真实歌手/曲名）：
 ```json
-{
-  "music_styles": {
-    "synthwave_chillwave": {
-      "name": "梦幻复古合成器与波形律动",
-      "description": "Synthwave & Chillwave",
-      "folder_name": "01-梦幻复古合成器与波形律动-Synthwave-Chillwave"
-    },
-    "future_bass_glitch": {
-      "name": "空灵未来贝斯与电音切片", 
-      "description": "Melodic Future Bass & Glitch",
-      "folder_name": "02-空灵未来贝斯与电音切片-Melodic-Future-Bass-Glitch"
-    }
-  },
-  "playlists": {
-    "synthwave_chillwave": [
-      {"title": "Resonance", "artist": "HOME"},
-      {"title": "Sunset", "artist": "The Midnight"}
-    ]
-  },
-  "download_settings": {
-    "sources": ["netease", "joox"],
-    "delay": 4,
-    "fallback": true,
-    "max_retries": 3
-  }
-}
+[
+  {"title": "Resonance", "artist": "HOME"},
+  {"title": "Sunset", "artist": "The Midnight"}
+]
 ```
 
-#### 步骤2: 创建下载目录
+#### 步骤2: 批量下载
 ```bash
-mkdir -p ~/music_downloads
-cd ~/music_downloads
+# 主站（多音源）
+node gd-flac-downloader.js --list playlist.json --out "downloads/01-风格名" \
+  --sources netease,joox --delay 4 --fallback
+
+# 或 run_all.sh 顺序处理所有 downloads/0* 文件夹
+./run_all.sh
+
+# 国际版（网易云/酷我，镜像可选 cn/hk/us/default）
+node gd-international-downloader.js "周杰伦" netease 999 5
 ```
 
-#### 步骤3: 运行批量下载
+#### 步骤3: 内嵌元数据
 ```bash
-# 使用默认配置
-python3 ~/music-processing-skills/music_downloader.py
-
-# 或指定配置文件
-python3 ~/music-processing-skills/music_downloader.py --config config.json
-```
-
-#### 步骤4: 内嵌元数据
-```bash
-# 处理所有下载的文件
-python3 ~/music-processing-skills/metadata_embedder.py --downloads-dir ~/music_downloads
+# 处理所有下载的文件（歌词/封面/翻译歌词自动补全）
+python3 flac_metadata_embedder.py --downloads-dir <项目根目录>
 
 # 处理单个文件
-python3 ~/music-processing-skills/metadata_embedder.py --single-file "~/music_downloads/song.flac"
+python3 flac_metadata_embedder.py --single-file "path/to/song.flac"
 ```
 
 ## 配置选项
@@ -193,14 +167,16 @@ music_downloads/
 ### 元数据内容
 每个FLAC文件包含以下元数据：
 - **TITLE**: 歌曲名称
-- **ARTIST**: 歌手名称  
+- **ARTIST / ARTISTS**: 歌手名称（含多值）
 - **ALBUM**: 专辑名称
 - **ALBUMARTIST**: 专辑艺术家
 - **COMPOSER**: 作曲家
 - **GENRE**: 音乐风格
 - **DATE**: 发行年份
-- **TRACKNUMBER**: 曲目编号
-- **TOTALTRACKS**: 总曲目数
+- **TRACKNUMBER / TOTALTRACKS**: 曲目编号 / 总曲目
+- **LYRICS**: 同步歌词文本
+- **LYRICS_TRANSLATED**: 翻译歌词（GD音乐台 tlyric）
+- **封面 PICTURE 块**: 专辑封面（metaflac --import-picture-from）
 - **COMMENT**: 备注信息
 - **LYRICS**: 歌词文本（如果有）
 
