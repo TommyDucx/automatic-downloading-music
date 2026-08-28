@@ -48,7 +48,14 @@ pip3 install requests beautifulsoup4 rapidfuzz soupsieve syncedlyrics
 
 ### 1. 准备歌单
 
-每个风格文件夹放一个 `playlist.json`：
+**方式 A：歌单链接直导（推荐）**——把网易云/QQ音乐/Spotify/酷狗分享链接解析成曲目列表：
+
+```bash
+node playlist-importer.js "https://music.163.com/playlist?id=7403678821" --out playlist.json
+node playlist-importer.js "https://open.spotify.com/playlist/xxx" --out playlist.json
+```
+
+**方式 B：手动写 JSON**——每个风格文件夹放一个 `playlist.json`：
 
 ```json
 [
@@ -60,9 +67,12 @@ pip3 install requests beautifulsoup4 rapidfuzz soupsieve syncedlyrics
 ### 2. 批量下载
 
 ```bash
-# 指定歌单 + 输出目录（多音源，自动防限流）
+# 指定歌单 + 输出目录（多音源，自动防限流 + 音质降级链）
 node gd-flac-downloader.js --list playlist.json --out "downloads/01-风格名" \
   --sources netease,joox --delay 4 --fallback
+
+# 或直接吃歌单链接（免手动写 JSON）
+node gd-flac-downloader.js --playlist "https://music.163.com/playlist?id=xxx" --out "downloads/01-风格名" --max 10
 
 # 或使用 run_all.sh 顺序处理所有风格文件夹
 ./run_all.sh
@@ -78,7 +88,7 @@ python3 flac_metadata_embedder.py --downloads-dir .
 python3 flac_metadata_embedder.py --single-file "path/to/song.flac"
 ```
 
-### 国际版下载（网易云/酷我）
+### 国际版下载（网易云/酷我，内置音质降级链）
 
 ```bash
 node gd-international-downloader.js "周杰伦" netease 999 5
@@ -92,21 +102,29 @@ node gd-international-downloader.js "流行音乐" kuwo 320 10
 | 参数 | 说明 |
 |------|------|
 | `--list <file>` | 歌单文件（txt 或 json） |
+| `--playlist <链接>` | 歌单链接直导（网易云/QQ/Spotify/酷狗） |
 | `--out <dir>` | 输出目录 |
 | `--sources a,b,c` | 搜索音源优先级（默认 netease,tencent,kuwo,joox,qobuz） |
-| `--br <n>` | 音质档位（999=24bit 无损，740=16bit 无损，320=MP3） |
+| `--br <n>` | 目标音质（999=24bit 无损，740=16bit 无损，320=MP3） |
+| `--br-min <n>` | 降级链下限（默认 128；目标拿不到自动逐档降 999→740→320→192→128） |
+| `--strict-br` | 关闭降级，目标档拿不到直接换下一音源 |
+| `--max <n>` | 最多下载前 n 首（歌单很大时限制数量） |
 | `--delay <sec>` | 请求间隔秒数（批量下载建议 ≥4） |
 | `--fallback` | 无无损时降级保存 320k MP3 |
 | `--force` | 已存在也重新下载 |
+
+已下载记录写入输出目录 `.downloaded.json`（本地缓存兜底），重复运行自动跳过。
 
 ## 技术原理
 
 - **主站** `music.gdstudio.org`：`/time` 取时间戳 → VM 跑 `crc32.min.js` 生成 `s=` 签名 → POST `/api.php`
 - **签名**：对 `encodeURIComponent(name)` 求自定义 crc32，取后 8 位大写
-- **音质优先级**：按 `br` 排序（999=FLAC），支持 `--fallback` 降级
+- **音质降级链**：目标 br 拿不到时逐档向下（借鉴 EchoMusic resolver 的候选降级思路），同一音源内先降级再换源
+- **歌单导入** `playlist-importer.js`：网易云/QQ音乐/Spotify/酷狗/汽水链接 → 标准曲目列表（借鉴 EchoMusic external providers）
 - **国际版** `music-api.gdstudio.xyz`：同样基于 CRC32 签名，支持网易云音乐、酷我音乐
 - **镜像分流**（国际版）：migu/kugou/ximalaya→`music-api-cn.gdstudio.xyz`，joox→`music-api-hk.gdstudio.xyz`，qobuz/ytmusic→`music-api-us.gdstudio.xyz`，可手动第 5 参数指定
 - **刮削接口**：`types=search / url / pic / lyric`（pic 封面尺寸 1000/640/500/300 回退，lyric 含 tlyric 翻译），失败指数退避（1s,2s,4s…上限 30s）
+- **限流与验证**：429 尊重 Retry-After；验证挑战（ssa-code/verify/captcha）等待 12s 单次重试；普通 401 指数退避（上限 4 次）
 
 ## 歌词存放规则
 

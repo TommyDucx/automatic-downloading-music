@@ -142,7 +142,6 @@ async function apiCall(domain, params, depth = 0) {
     const body = parts.join('&');
     
     log(`API调用: ${domain}/api.php`, 'info');
-    log(`请求参数: ${body}`, 'info');
     
     // 发送请求
     const url = `https://${domain}/api.php`;
@@ -156,13 +155,30 @@ async function apiCall(domain, params, depth = 0) {
             body: body
         });
         
-        log(`API响应状态: ${response.statusCode}`, 'info');
+        // 429 / 显式限流：尊重 Retry-After（若有），否则指数冷却
+        if (response.statusCode === 429) {
+            if (depth < CONFIG.MAX_RETRIES) {
+                const ra = parseFloat(response.headers?.['retry-after']);
+                const cool = (Number.isFinite(ra) && ra > 0 ? ra : 5 * Math.pow(2, Math.min(depth, 3))) * 1000;
+                log(`触发限流(429)，冷却 ${Math.round(cool / 1000)}s 后重试...`, 'warning');
+                await delay(cool);
+                return apiCall(domain, params, depth + 1);
+            }
+            throw new Error('触发站点限流(429)，请调大请求间隔稍后再试');
+        }
         
         if (response.statusCode === 401 && response.data.includes('Invalid request')) {
+            // 区分验证挑战 vs 普通签名失败
+            const isVerify = /verify|验证|challenge|slide|captcha/i.test(response.data.slice(0, 500));
+            if (isVerify && depth === 0) {
+                log('站点要求安全验证，等待 12s 后重试一次...', 'warning');
+                await delay(12000);
+                return apiCall(domain, params, depth + 1);
+            }
             // 签名失败，重试
             if (depth < CONFIG.MAX_RETRIES) {
                 log('签名失败，延迟后重试...', 'warning');
-                await delay(getRandomDelay());
+                await delay(getRandomDelay() * Math.pow(2, Math.min(depth, 2)));
                 return apiCall(domain, params, depth + 1);
             } else {
                 throw new Error('签名校验失败，已达最大重试次数');
@@ -210,27 +226,45 @@ async function searchMusic(domain, query, source = CONFIG.DEFAULT_SOURCE) {
 
 // 获取音乐URL
 async function getMusicUrl(domain, trackId, source = CONFIG.DEFAULT_SOURCE, quality = CONFIG.DEFAULT_QUALITY) {
-    log(`获取音乐URL: ${trackId} (${source}) - 质量: ${quality}`, 'info');
-    
-    const params = {
-        types: 'url',
-        source: source,
-        id: trackId,
-        br: quality
-    };
-    
-    const result = await apiCall(domain, params);
-    
-    if (result.status !== 200 || !result.json) {
-        throw new Error(`获取URL失败: ${result.status} - ${result.data || result.json}`);
+    // 音质降级链：从目标档向下逐档（999→740→320→192→128），借鉴 EchoMusic resolver 候选降级思路。
+    // 各源支持档位见 CONFIG.SOURCES[source].qualities，按该列表从目标档开始降级。
+    const supported = CONFIG.SOURCES[source]?.qualities || ['128', '320', '999'];
+    const ordered = [...supported].sort((a, b) => Number(b) - Number(a));
+    const startIdx = ordered.indexOf(String(quality));
+    const targets = startIdx >= 0 ? ordered.slice(startIdx) : [String(quality)];
+
+    let lastError = null;
+    let lastDenied = null;
+    for (const q of targets) {
+        log(`获取音乐URL: ${trackId} (${source}) - 质量: ${q}`, 'info');
+        const params = {
+            types: 'url',
+            source: source,
+            id: trackId,
+            br: q
+        };
+
+        const result = await apiCall(domain, params);
+
+        if (result.status !== 200 || !result.json) {
+            lastError = new Error(`获取URL失败: ${result.status}`);
+            continue;
+        }
+
+        if (result.json.br === -2 || result.json.br === -3) {
+            lastDenied = { ...result.json, denied: true, br: q };
+            continue;
+        }
+        if (result.json.br === -1 || !result.json.url || result.json.url === 'err') {
+            continue;
+        }
+
+        log(`成功获取URL: ${result.json.url}`, 'success');
+        return { ...result.json, requestedBr: q, degraded: Number(q) < Number(quality) };
     }
-    
-    if (result.json.br === -1 || !result.json.url || result.json.url === 'err') {
-        throw new Error(`音乐不可用或音质不支持`);
-    }
-    
-    log(`成功获取URL: ${result.json.url}`, 'success');
-    return result.json;
+    if (lastDenied) return lastDenied;
+    if (lastError) throw lastError;
+    throw new Error(`音乐不可用或音质不支持（已尝试 ${targets.join('→')}）`);
 }
 
 // 下载音乐文件
@@ -317,11 +351,21 @@ async function downloadMusicTrack(domain, track, source = CONFIG.DEFAULT_SOURCE,
     try {
         log(`开始下载: ${track.name} - ${track.artist?.join('/') || '未知'}`, 'info');
         
-        // 获取音乐URL
+        // 获取音乐URL（含音质降级链）
         const urlResult = await getMusicUrl(domain, track.id, source, quality);
         
+        if (urlResult.denied) {
+            log(`无版权/试听受限（br=${urlResult.br}），跳过`, 'warning');
+            return {
+                success: false,
+                track: track,
+                denied: true,
+                error: `无版权/试听受限（br=${urlResult.br}）`
+            };
+        }
+        
         // 格式化文件名
-        const filename = formatFilename(track, quality);
+        const filename = formatFilename(track, urlResult.requestedBr || urlResult.br || quality);
         
         // 下载音乐
         const outputPath = await downloadMusic(urlResult.url, filename);
@@ -332,7 +376,8 @@ async function downloadMusicTrack(domain, track, source = CONFIG.DEFAULT_SOURCE,
             filename: filename,
             outputPath: outputPath,
             url: urlResult.url,
-            quality: urlResult.br
+            quality: urlResult.br,
+            degraded: urlResult.degraded
         };
     } catch (error) {
         log(`下载失败: ${track.name} - ${error.message}`, 'error');

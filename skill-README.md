@@ -54,6 +54,7 @@ music-processing-skills/
 ├── SKILL.md                       # 技能说明（完整工作流，主文档）
 ├── gd-flac-downloader.js          # 主站下载器（Node 零依赖，music.gdstudio.org）
 ├── gd-international-downloader.js # 国际版下载器（music-api.gdstudio.xyz + cn/hk/us 镜像）
+├── playlist-importer.js           # 歌单链接导入（网易云/QQ/Spotify/酷狗 → 曲目列表）
 ├── flac_metadata_embedder.py      # 元数据+歌词+封面+翻译 内嵌（Python + metaflac）
 ├── run_all.sh                     # 批量下载驱动（顺序遍历 downloads/0*）
 ├── retry_failed.sh                # 失败重试脚本
@@ -66,11 +67,16 @@ music-processing-skills/
 
 ### 快速开始（真实脚本）
 ```bash
-# 1. 批量下载（主站，歌单驱动，多音源自动防限流）
+# 0. 歌单链接直导（可选）：把分享链接解析成 playlist.json
+node playlist-importer.js "https://music.163.com/playlist?id=7403678821" --out downloads/01-风格目录/playlist.json
+
+# 1. 批量下载（主站，歌单驱动，多音源自动防限流 + 音质降级链）
 node gd-flac-downloader.js --list playlist.json --out "downloads/01-风格目录" \
   --sources netease,joox --delay 4 --fallback
+# 或直接吃歌单链接：
+node gd-flac-downloader.js --playlist "https://open.spotify.com/playlist/xxx" --out "downloads/01-风格目录" --max 10
 
-# 2. 批量下载（国际版，关键词驱动）
+# 2. 批量下载（国际版，关键词驱动，内置降级链）
 node gd-international-downloader.js "周杰伦" netease 999 5
 
 # 3. 内嵌元数据 + 歌词 + 封面 + 翻译
@@ -82,7 +88,17 @@ python3 flac_metadata_embedder.py --single-file "path/to/song.flac"
 ### 详细步骤
 
 #### 步骤1: 准备歌单
-每个风格文件夹放一个 `playlist.json`（数组，元素 `{"title": "...", "artist": "..."}`，必须用真实歌手/曲名）：
+两种方式：
+
+**A. 分享链接导入（推荐，新功能）**——把网易云/QQ音乐/Spotify/酷狗歌单链接解析成曲目列表：
+```bash
+node playlist-importer.js "https://music.163.com/playlist?id=7403678821" --out playlist.json
+node playlist-importer.js "https://y.qq.com/n/ryqq/playlist/8612270405" --out playlist.json
+node playlist-importer.js "https://open.spotify.com/playlist/xxx" --out playlist.json
+node playlist-importer.js "歌手 - 歌名" --out playlist.json     # 纯文本直通
+```
+
+**B. 手动写 JSON**——每个风格文件夹放一个 `playlist.json`（数组，元素 `{"title": "...", "artist": "..."}`，必须用真实歌手/曲名）：
 ```json
 [
   {"title": "Resonance", "artist": "HOME"},
@@ -92,14 +108,16 @@ python3 flac_metadata_embedder.py --single-file "path/to/song.flac"
 
 #### 步骤2: 批量下载
 ```bash
-# 主站（多音源）
+# 主站（多音源 + 音质降级链：999→740→320→192→128）
 node gd-flac-downloader.js --list playlist.json --out "downloads/01-风格名" \
   --sources netease,joox --delay 4 --fallback
+# 歌单链接直导 + 限数量：
+node gd-flac-downloader.js --playlist "https://music.163.com/playlist?id=xxx" --out "downloads/01-风格名" --max 10
 
 # 或 run_all.sh 顺序处理所有 downloads/0* 文件夹
 ./run_all.sh
 
-# 国际版（网易云/酷我，镜像可选 cn/hk/us/default）
+# 国际版（网易云/酷我，镜像可选 cn/hk/us/default；999 拿不到自动降档）
 node gd-international-downloader.js "周杰伦" netease 999 5
 ```
 
@@ -182,28 +200,30 @@ music_downloads/
 
 ## 高级功能
 
-### 1. 自定义音源
+### 1. 自定义音源与音质
 ```bash
-# 编辑配置文件，添加自定义音源
-python3 music_downloader.py --sources netease,spotify,custom_api
+# 多音源优先级 + 音质降级链（目标 br 拿不到自动向下，--strict-br 关闭）
+node gd-flac-downloader.js "Fortnight - Taylor Swift" --sources qobuz,joox,netease --br 999 --br-min 320
 ```
 
 ### 2. 断点续传
 ```bash
-# 继续未完成的下载
-python3 music_downloader.py --resume
+# 已下载歌曲自动跳过（.downloaded.json 索引 + 同名文件检查），重新运行即可续传
+node gd-flac-downloader.js --list playlist.json --out "downloads/01-风格名" --sources netease,joox --delay 4
+# 限流被断后：等冷却再跑同一条命令，已完成的自动跳过
 ```
 
 ### 3. 元数据验证
 ```bash
-# 验证元数据完整性
-python3 metadata_embedder.py --verify
+# 用 metaflac 检查内嵌结果
+metaflac --list --block-type=VORBIS_COMMENT "path/to/song.flac"
+metaflac --list --block-type=PICTURE "path/to/song.flac"
 ```
 
-### 4. 歌词更新
+### 4. 歌词更新（只补歌词/封面，不重新下载）
 ```bash
-# 只更新歌词，不重新下载（歌词仍保存到歌曲所在文件夹）
-python3 metadata_embedder.py --update-lyrics
+python3 flac_metadata_embedder.py --single-file "path/to/song.flac"   # 单文件补全
+python3 flac_metadata_embedder.py --downloads-dir <项目根目录>        # 全库补全（自动跳过已有元数据的）
 ```
 
 ## 故障排除

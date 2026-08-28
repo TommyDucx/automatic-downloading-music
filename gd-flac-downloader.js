@@ -18,15 +18,20 @@
  *   node gd-flac-downloader.js --list songs.txt        # 每行 "歌名 - 歌手"
  *   node gd-flac-downloader.js --list songs.json       # [{"name":"...","artist":"..."}]
  *   node gd-flac-downloader.js --sources netease,joox,qobuz --br 999
+ *   node gd-flac-downloader.js --playlist "https://music.163.com/playlist?id=xxx"  # 歌单链接直导（网易云/QQ/Spotify/酷狗）
+ *   node gd-flac-downloader.js --playlist "https://open.spotify.com/playlist/xxx" --max 10   # 只下前 10 首
  *
  * 可选参数：
  *   --host <music.gdstudio.org|music.gdstudio.xyz>  默认 music.gdstudio.org（国内直连）
  *   --proxy <http://127.0.0.1:7897>                 使用代理时走 curl 传输
  *   --br 999|740|320                                默认 999（尽量无损）
+ *   --br-min 320                                    音质降级链下限（默认 128；999→740→320→192→128 逐档降）
+ *   --strict-br                                     不降级：br 档位拿不到就换下一音源（默认会逐档降级）
  *   --sources netease,joox,tencent,qobuz,migu,kuwo  搜索音源优先级
  *   --out <目录>                                    默认 ./downloads
  *   --delay <秒>                                    请求间隔，默认 3（站点限流严格，请勿调太小）
  *   --fallback                                      无 FLAC 时降级保存 320k MP3
+ *   --max <n>                                       最多下载前 n 首（歌单导入时限制数量）
  *   --force                                         已存在也重新下载
  */
 
@@ -57,12 +62,16 @@ function parseArgs(argv) {
     host: "music.gdstudio.org",
     proxy: process.env.GD_PROXY || null,
     br: 999,
+    brMin: 128,
+    strictBr: false,
     sources: ["netease", "tencent", "kuwo", "joox", "qobuz"],
     out: path.join(process.cwd(), "downloads"),
     delay: 4,
     fallback: false,
     force: false,
     list: null,
+    playlist: null,
+    max: 0,
     queries: [],
   };
   for (let i = 0; i < argv.length; i++) {
@@ -78,6 +87,12 @@ function parseArgs(argv) {
       case "--br":
         cfg.br = parseInt(next(), 10);
         break;
+      case "--br-min":
+        cfg.brMin = parseInt(next(), 10);
+        break;
+      case "--strict-br":
+        cfg.strictBr = true;
+        break;
       case "--sources":
         cfg.sources = next().split(",").map((s) => s.trim()).filter(Boolean);
         break;
@@ -90,6 +105,12 @@ function parseArgs(argv) {
       case "--list":
         cfg.list = path.resolve(next());
         break;
+      case "--playlist":
+        cfg.playlist = next();
+        break;
+      case "--max":
+        cfg.max = parseInt(next(), 10);
+        break;
       case "--fallback":
         cfg.fallback = true;
         break;
@@ -99,7 +120,7 @@ function parseArgs(argv) {
       case "--help":
       case "-h":
         console.log(
-          "用法: node gd-flac-downloader.js \"歌名 - 歌手\" ...  | --list songs.txt | --help"
+          "用法: node gd-flac-downloader.js \"歌名 - 歌手\" ...  | --list songs.txt | --playlist <链接> | --help"
         );
         process.exit(0);
         break;
@@ -259,10 +280,32 @@ async function apiCall(params, depth) {
         body,
       });
       const txt = await r.text();
-      if (r.status === 401 && txt.includes("Invalid request")) {
+
+      // 429 / 限流：尊重 Retry-After（若有），否则指数冷却
+      if (r.status === 429) {
+        const ra = parseFloat(r.headers.get("retry-after"));
+        const cool = Number.isFinite(ra) && ra > 0 ? ra * 1000 : 5000 * Math.pow(2, Math.min(depth, 3));
+        if (depth < 4) {
+          console.log(`   [限流 429] 冷却 ${Math.round(cool / 1000)}s 后重试…`);
+          await sleep(cool);
+          return apiCall(params, depth + 1);
+        }
+        throw new Error("触发站点限流（429），请增大 --delay 稍后再试");
+      }
+
+      // 401 需细分：签名过期（Invalid request）vs 验证挑战（ssa-code / verify）
+      if (r.status === 401 || (r.status === 200 && txt.includes("Invalid request"))) {
+        const ssaCode = r.headers.get("ssa-code") || r.headers.get("SSA-CODE");
+        const isVerifyChallenge = !!ssaCode || /verify|验证|challenge|slide|captcha/i.test(txt.slice(0, 500));
+        if (isVerifyChallenge && depth === 0) {
+          // 首次遇到验证挑战：尝试等待站点释放验证后单次重试；不重复打扰
+          console.log("   [!] 站点要求安全验证（ssa-code），等待 12s 后重试一次…");
+          await sleep(12000);
+          return apiCall(params, depth + 1);
+        }
         // 签名过期/被拒：大概率是限流或时间窗口问题，冷却后重试，但限制总次数避免死循环
         if (depth < 4) {
-          await sleep(5000);
+          await sleep(5000 * Math.pow(2, Math.min(depth, 2)));
           return apiCall(params, depth + 1);
         }
         throw new Error("签名校验失败（可能触发站点限流，请稍后再试）");
@@ -364,13 +407,40 @@ async function searchSource(src, query) {
 }
 
 async function getStream(track, src) {
-  await politeDelay();
-  const r = await apiCall({ types: "url", id: track.id, source: src, br: CFG.br });
-  if (r.status !== 200 || !r.json) return null;
-  const j = r.json;
-  if (j.br === -3 || j.br === -2) return { ...j, denied: true };
-  if (!j.url || j.url === "err" || j.br === -1) return null;
-  return j;
+  // 音质降级链：从目标 br 逐档向下（999→740→320→192→128），直到 brMin 为止。
+  // 借鉴 EchoMusic resolver 的候选降级思路；--strict-br 时只在目标档尝试。
+  const BR_LADDER = [999, 740, 320, 192, 128];
+  const startIdx = BR_LADDER.indexOf(CFG.br) >= 0 ? BR_LADDER.indexOf(CFG.br) : 0;
+  const minIdx = CFG.strictBr ? startIdx : Math.max(BR_LADDER.indexOf(CFG.brMin), 0);
+  // BR_LADDER 本身是降序，slice 出 [br .. brMin] 即从高到低逐档尝试
+  const targets = BR_LADDER.slice(startIdx, minIdx + 1);
+
+  let lastDenied = null;
+  let lastErr = null;
+  for (const br of targets) {
+    await politeDelay();
+    let r;
+    try {
+      r = await apiCall({ types: "url", id: track.id, source: src, br });
+    } catch (e) {
+      lastErr = e;
+      continue;
+    }
+    if (r.status !== 200 || !r.json) continue;
+    const j = r.json;
+    if (j.br === -3 || j.br === -2) {
+      // 该档位无权限/试听受限：记录后尝试更低档
+      lastDenied = { ...j, denied: true, br };
+      continue;
+    }
+    if (!j.url || j.url === "err" || j.br === -1) continue;
+    // 拿到可用 URL：若实际返回 br 低于请求档，说明站点自动降级了，直接采用
+    const actualBr = Number(j.br) > 0 ? Number(j.br) : br;
+    return { ...j, requestedBr: br, degraded: actualBr < CFG.br };
+  }
+  if (lastDenied) return lastDenied;
+  if (lastErr) throw lastErr;
+  return null;
 }
 
 function extOf(url, br) {
@@ -388,8 +458,21 @@ async function downloadOne(query, index, total) {
   console.log(`\n[${index}/${total}] 下载: ${label}`);
 
   // 断点续跑：已存在同名文件则直接跳过（不消耗 API 配额）
+  // 本地缓存兜底：优先用 .downloaded.json 索引（记录 {safeBase: {file, src, br}}），
+  // 索引缺失时回退扫目录；--force 或新下载成功时写回索引。
   const safeBase = `${label}`.replace(/[\\/:*?"<>|]/g, " ").replace(/\s+/g, " ").trim();
   if (!CFG.force) {
+    fs.mkdirSync(CFG.out, { recursive: true });
+    const indexFile = path.join(CFG.out, ".downloaded.json");
+    let idx = {};
+    try { idx = JSON.parse(fs.readFileSync(indexFile, "utf8")); } catch {}
+    if (idx[safeBase]) {
+      const rec = idx[safeBase];
+      if (fs.existsSync(path.join(CFG.out, rec.file))) {
+        console.log(`[=] 已存在（索引），跳过: ${rec.file}${rec.br ? ` (${rec.src} ${rec.br}kbps)` : ""}`);
+        return true;
+      }
+    }
     const existing = fs.readdirSync(CFG.out).filter((f) => f.startsWith(safeBase + "."));
     if (existing.length > 0) {
       console.log(`[=] 已存在，跳过: ${path.join(CFG.out, existing[0])}`);
@@ -398,6 +481,10 @@ async function downloadOne(query, index, total) {
   }
 
   let chosen = null; // { track, src, stream }
+  // ---- 多源 resolve/transform 管道（借鉴 EchoMusic audioSource 管道思想）----
+  // resolve 阶段：按 CFG.sources 顺序逐源搜索匹配出曲目（候选源队列）
+  // transform 阶段：取流（含音质降级链 br→brMin）、过滤无版权/非无损，失败换下一源
+  // 命中无损即停（省配额）；fallback 开启时保留降级候选继续找更高品质
   for (const src of CFG.sources) {
     await politeDelay();
     let track;
@@ -436,7 +523,8 @@ async function downloadOne(query, index, total) {
     }
     const ext = extOf(stream.url, stream.br);
     const isLossless = ext === "flac" || ext === "ape" || ext === "alac" || stream.br > 320;
-    console.log(`   ${src}: 获得 ${ext.toUpperCase()} ${stream.br || "?"}kbps ${stream.size ? Math.round(stream.size / 1048576) + "MB" : ""}`);
+    const degradeNote = stream.degraded ? `（已从 ${CFG.br} 降级）` : "";
+    console.log(`   ${src}: 获得 ${ext.toUpperCase()} ${stream.br || "?"}kbps${degradeNote} ${stream.size ? Math.round(stream.size / 1048576) + "MB" : ""}`);
     if (isLossless) {
       chosen = { track, src, stream };
       break; // 拿到无损即停
@@ -466,6 +554,14 @@ async function downloadOne(query, index, total) {
     fs.unlinkSync(file);
     return false;
   }
+  // 写回下载索引（本地缓存兜底）：下次同歌名直接跳过，不消耗搜索/取流配额
+  try {
+    const indexFile = path.join(CFG.out, ".downloaded.json");
+    let idx = {};
+    try { idx = JSON.parse(fs.readFileSync(indexFile, "utf8")); } catch {}
+    idx[safeBase] = { file: path.basename(file), src, br: stream.br ?? null, size, time: Date.now() };
+    fs.writeFileSync(indexFile, JSON.stringify(idx, null, 2));
+  } catch {}
   console.log(`[+] 完成 (${src} ${ext.toUpperCase()}): ${file} (${Math.round(size / 1048576)}MB)`);
   return true;
 }
@@ -496,7 +592,31 @@ function loadQueries(cfg) {
       for (const line of raw.split(/\r?\n/)) push(line);
     }
   }
+  if (cfg.playlist) {
+    // 歌单链接直导：网易云/QQ/Spotify/酷狗 → 曲目列表（借鉴 EchoMusic external providers）
+    const { importPlaylist } = require("./playlist-importer.js");
+    return importPlaylist(cfg.playlist)
+      .then((result) => {
+        console.log(`[i] 歌单导入: ${result.provider}「${result.name}」共 ${result.tracks.length} 首`);
+        let tracks = result.tracks;
+        if (cfg.max > 0 && tracks.length > cfg.max) {
+          console.log(`[i] --max ${cfg.max}：仅下载前 ${cfg.max} 首`);
+          tracks = tracks.slice(0, cfg.max);
+        }
+        for (const t of tracks) {
+          qs.push({ title: String(t.title || "").trim(), artist: String(t.artist || "").trim() });
+        }
+        return qs;
+      })
+      .catch((e) => {
+        throw new Error(`歌单导入失败: ${e.message}`);
+      });
+  }
   for (const q of cfg.queries) push(q);
+  if (cfg.max > 0 && qs.length > cfg.max) {
+    console.log(`[i] --max ${cfg.max}：仅下载前 ${cfg.max} 首`);
+    return qs.slice(0, cfg.max);
+  }
   return qs;
 }
 
@@ -507,13 +627,13 @@ const CFG = parseArgs(process.argv.slice(2));
 let RUNTIME = null;
 
 (async () => {
-  const queries = loadQueries(CFG);
+  const queries = await loadQueries(CFG);
   if (queries.length === 0) {
     console.error("没有待下载歌曲。用法见 --help。");
     process.exit(1);
   }
   RUNTIME = await ensureRuntime();
-  console.log(`[i] 站点: https://${CFG.host}  音质: br=${CFG.br}  音源顺序: ${CFG.sources.join(", ")}`);
+  console.log(`[i] 站点: https://${CFG.host}  音质: br=${CFG.br}${CFG.strictBr ? "（不降级）" : `（可降至 ${CFG.brMin}）`}  音源顺序: ${CFG.sources.join(", ")}`);
   console.log(`[i] 输出目录: ${CFG.out}   请求间隔: ${CFG.delay}s${CFG.fallback ? "   允许降级MP3" : ""}`);
 
   let ok = 0;

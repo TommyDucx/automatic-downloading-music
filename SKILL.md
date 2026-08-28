@@ -57,6 +57,25 @@ def norm(s): return re.sub(r'[\s\-_]+', '', s).lower()
 
 目录名建议：`NN-中文描述-StyleTag`（StyleTag 用于映射 GENRE）。
 
+**歌单链接直导（新）**：不想手写 JSON 时，可用 `playlist-importer.js` 把分享链接解析成曲目列表（借鉴 EchoMusic 的多平台歌单导入思路）：
+
+```bash
+# 解析歌单链接 → 标准 playlist.json（供下载器 --list 使用）
+node playlist-importer.js "https://music.163.com/playlist?id=7403678821" --out downloads/01-xxx/playlist.json
+node playlist-importer.js "https://y.qq.com/n/ryqq/playlist/8612270405" --out playlist.json
+node playlist-importer.js "https://open.spotify.com/playlist/xxx" --out playlist.json
+node playlist-importer.js "歌手 - 歌名" --out playlist.json     # 纯文本直通
+```
+
+支持平台：网易云（含 163cn.tv 短链）、QQ 音乐、Spotify、酷狗（含短链）、汽水音乐、文本。
+输出 `[{title, artist}]`；也可 `--txt` 输出 "歌名 - 歌手" 每行。纯数字 ID 需加 `--platform <平台>`。
+
+下载器也可直接吃链接（免去中间文件）：
+
+```bash
+node gd-flac-downloader.js --playlist "https://music.163.com/playlist?id=xxx" --out <文件夹> --max 10
+```
+
 ## 步骤 2：批量下载
 
 使用 `gd-flac-downloader.js`（Node，无第三方依赖），用法：
@@ -70,15 +89,22 @@ node gd-flac-downloader.js --list <playlist.json> --out <歌曲文件夹> \
 - `--sources`：netease,joox,tencent,kuwo,migu,qobuz,spotify,apple,ytmusic（逗号分隔）
 - `--delay`：请求间隔秒数；默认 3，批量下载务必 ≥4
 - `--fallback`：允许降级 MP3
+- `--br 999|740|320`：目标音质，默认 999（24bit FLAC）
+- `--br-min 320`：音质降级链下限，默认 128。**降级链**：目标 br 拿不到时自动逐档向下试（999→740→320→192→128），同一音源内先降级再换源，借鉴 EchoMusic resolver 的候选降级思路
+- `--strict-br`：关闭降级，目标 br 拿不到就直接换下一音源
+- `--playlist <链接>`：歌单链接直导（网易云/QQ/Spotify/酷狗），免手动写 JSON
+- `--max <n>`：最多下载前 n 首（歌单很大时限制数量）
 - `--force`：已存在也重新下载；不传则已存在文件直接跳过（不耗 API 配额）
+
+已下载记录写入 `<out>/.downloaded.json`（本地缓存兜底）：同一首歌名重复运行直接跳过，不消耗搜索/取流配额。
 
 驱动脚本 `run_all.sh` 顺序遍历 `downloads/0*/playlist.json` 逐个文件夹下载，日志写 `/tmp/gdmusic_batch.log`。
 
 ### 国际版批量下载（gd-international-downloader.js）
-按关键词搜索下载（网易云 / 酷我），自动跳过已存在文件：
+按关键词搜索下载（网易云 / 酷我），自动跳过已存在文件；**同样内置音质降级链**（按音源支持档位从目标档向下）：
 
 ```bash
-node gd-international-downloader.js "周杰伦" netease 999 5        # 网易云 FLAC
+node gd-international-downloader.js "Taylor Swift" netease 999 5    # 网易云 FLAC（999 拿不到自动降 320）
 node gd-international-downloader.js "流行音乐" kuwo 320 10        # 酷我 320k
 node gd-international-downloader.js "周杰伦" netease 999 5 cn     # 手动指定镜像
 ```
@@ -91,11 +117,12 @@ node gd-international-downloader.js "周杰伦" netease 999 5 cn     # 手动指
 - 搜索返回 `401 {"detail":"Invalid request."}`
 - 下载卡死（401 递归死循环）
 
-对策（已内置到下载器）：
+对策（已内置到下载器，JS 与 Python 两端一致）：
 1. `apiCall(params, depth)` 对 401 做深度上限 4 的冷却重试，超过即抛错跳过，绝不无限递归
-2. `politeDelay()`：`delay * (0.7 + Math.random()*0.6)` 随机抖动
-3. `downloadOne` 开头先检查同名音频文件已存在则跳过，不发 API 请求
-4. 触发限流后：kill 进程 → 等冷却 → 以更大 delay 续跑（已存在文件自动跳过 = 断点续传）
+2. 401 细分处理：`ssa-code`/verify/captcha 等验证挑战头 → 等待 12s 单次重试；普通 401（签名过期/隐性限流）→ 指数退避；429 显式限流 → 尊重 `Retry-After` 头冷却
+3. `politeDelay()`：`delay * (0.7 + Math.random()*0.6)` 随机抖动
+4. `downloadOne` 开头先查 `.downloaded.json` 索引与同名音频文件，已存在则跳过，不发 API 请求
+5. 触发限流后：kill 进程 → 等冷却 → 以更大 delay 续跑（已存在文件自动跳过 = 断点续传）
 
 ### 网络拓扑
 - **主站**: `https://music.gdstudio.org` ✅ 完全支持（`gd-flac-downloader.js`）

@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import time
+import re
 import argparse
 import subprocess
 import tempfile
@@ -96,7 +97,13 @@ class GDMusicClient:
         return self.DOMAINS.get(self.MIRROR_BY_SOURCE.get(src, "default"), self.DOMAINS["default"])
 
     def api_call(self, params, source=None, depth=0):
-        """POST form 到 <mirror>/api.php，附 crc32 签名；401/网络错误指数退避重试"""
+        """POST form 到 <mirror>/api.php，附 crc32 签名；429/401/网络错误指数退避重试。
+
+        错误细分（借鉴 EchoMusic 对 ssa-code/限流的处理）：
+        - 429 或 Retry-After：显式限流，按 Retry-After 或指数冷却（上限 60s）
+        - 401 + 验证挑战关键词（verify/captcha/验证/滑块）：等待 12s 单次重试，避免死循环
+        - 401 + Invalid request（签名过期/隐性限流）：指数退避重试
+        """
         src = source or self.source
         domain = self.mirror_for(src)
         parts = []
@@ -120,8 +127,26 @@ class GDMusicClient:
                 return self.api_call(params, source, depth + 1)
             raise
 
+        # 429 显式限流：尊重 Retry-After 头，否则指数冷却（上限 60s）
+        if resp.status_code == 429:
+            if depth < self.max_retries:
+                retry_after = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+                try:
+                    cool = float(retry_after) if retry_after else min(2 ** depth, 60)
+                except (TypeError, ValueError):
+                    cool = min(2 ** depth, 60)
+                time.sleep(cool)
+                return self.api_call(params, source, depth + 1)
+            raise RuntimeError("触发站点限流(429)，请增大请求间隔稍后再试")
+
         if resp.status_code == 401 or (resp.status_code == 200 and "Invalid request" in resp.text[:200]):
-            # 签名失败/限流，冷却后重试
+            head = resp.text[:500]
+            # 验证挑战（ssa-code / verify / captcha / 滑块）：等待后单次重试
+            is_verify = bool(re.search(r"verify|captcha|验证|滑块|challenge", head, re.IGNORECASE))
+            if is_verify and depth == 0:
+                time.sleep(12)
+                return self.api_call(params, source, depth + 1)
+            # 签名失败/隐性限流：指数退避重试
             if depth < self.max_retries:
                 wait_backoff()
                 return self.api_call(params, source, depth + 1)
