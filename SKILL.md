@@ -136,6 +136,26 @@ API 返回 `{songname, artist, album, url, br, size, source, lrc}`；`url` 为�
 国际版签名：`s = crc32Hex(encodeURIComponent(name 或 id))`，POST form 到 `<mirror>/api.php`；
 限流口径约 50 次/5 分钟，遇 401 自动指数退避重试。
 
+### ⚠️ 假限流：查询串含 `(` `)` `'` 时搜索必失败（实测 2026-08-29）
+
+现象：标题里带半角括号或撇号时，所有音源都返回
+`搜索失败（签名校验失败（可能触发站点限流，请稍后再试））`，**看起来像被限流，其实不是**——
+同一时刻换成纯 ASCII 标题立刻正常返回（命中或 `未找到匹配曲目`）。
+
+原因：`encodeURIComponent` **不会**转义 `!'()*-._~`，这些字符原样进入 form body 后服务端算出的
+签名与本地不一致。凡是 `(` `)` `'` 参与的查询都会挂。
+
+| 想下的曲名 | 报错 | 改用 | 结果 |
+|---|---|---|---|
+| `Luv(sic) Part 2` | 签名校验失败 | `Luv sic Part 2` | netease 命中（可能匹配到 A Cappella 版，音质低） |
+| `Luv(sic) Part 3` | 签名校验失败 | `Luv sic Part 3` | 同上 |
+| `World's End Rhapsody` | 签名校验失败 | `Worlds End Rhapsody` | 各源均 `未找到匹配曲目`（是真的没有，不是限流） |
+
+排查口诀：**先用一个纯 ASCII 标题探一次**，能通就不是限流，而是标题里的标点问题；
+按上表去掉 `(` `)` `'` 后重试。注意模糊匹配会把不同 Part 折叠到同一条结果（实测 joox 把
+`Part 2` / `Part 3` 都指向同一首 `Luv(Sic)`，下到两个 30MB 的**完全相同**文件），
+下完务必 `shasum` 查重再入库。
+
 ## 步骤 3：内嵌元数据
 
 用 `flac_metadata_embedder.py`（Python + metaflac）批量处理：
@@ -157,13 +177,21 @@ python3 flac_metadata_embedder.py --single-file "path/to/song.flac"
 
 ### 元数据来源逻辑
 - `TITLE/ARTIST`：从文件名 `歌手 - 歌名.flac` 解析
-- `GENRE`：从文件夹名 StyleTag 映射（Synthwave-Chillwave → "Synthwave, Chillwave" 等）
-- `ALBUM/DATE/COMPOSER`：按歌手查内置专辑表，未命中则 `{歌手} Collection` + 当前年份
+- `GENRE`：优先查内置映射表（Synthwave-Chillwave → "Synthwave, Chillwave" 等）；
+  未命中则**从目录名的 StyleTag 推导**（`Jazzhop-Lo-fi-Hip-Hop` → `Jazzhop, Lo-fi, Hip-Hop`，
+  内置复合词表保证 `Lo-fi` / `Hip-Hop` 不会被切成两个词）；
+  再推导不出才回落 `Electronic` 并**打印告警**（不再静默写错值）
+- `ALBUM`：**优先取 GD音乐台刮削到的真实专辑名**（`modal soul` → `Modal Soul`）；
+  刮不到才回落到「歌手 → 内置专辑表」，再兜底 `{歌手} Collection`
+- `DATE/COMPOSER`：仍按歌手查内置表 —— ⚠️ 搜索接口不返回年份，所以 DATE 是**歌手级近似值**，
+  一首歌跨专辑时可能不准（已知局限，暂无数据源可修）
 - `TRACKNUMBER`：在 playlist.json 中的序号；未匹配默认 1
 - `LYRICS`：syncedlyrics 搜索，失败换 `https://api.lrc.cx/api/v1/lyrics/single`；再失败走 GD音乐台 `types=lyric` 兜底；**先写 lrc 文件到歌曲文件夹，再读内容内嵌**
 - `LYRICS_TRANSLATED`：GD音乐台 `types=lyric` 返回的 `tlyric` 翻译歌词
 - **封面（PICTURE）**：GD音乐台搜索 -> 取 `pic_id` -> `types=pic`（尺寸 1000/640/500/300 回退）-> 带 Referer 下载 -> `metaflac --import-picture-from` 内嵌
 - 歌词入 Vorbis 注释前需清洗：去掉 `[00:00.00]` 时间戳行与元信息行（`作曲:` `作词:` 等），否则 `--import-tags-from` 会报 malformed vorbis comment
+- **一次搜索三处复用**：`resolve_gd_track()` 按 (曲名, 歌手) 缓存搜索命中，
+  专辑名 / 封面 / 歌词共用同一次搜索，避免每首歌重复打 2~3 次 API（省配额、降限流概率）
 
 ### GD音乐台刮削（封面/翻译歌词）参考实现
 - 接口形态与签名参考 [gdstudio-embeded-service](https://github.com/Azincc/gdstudio-embeded-service)（types=search/pic/lyric、封面尺寸回退、tlyric 翻译、镜像分流）

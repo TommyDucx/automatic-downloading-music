@@ -293,6 +293,8 @@ class FLACMetadataEmbedder:
         self.use_gdmusic = use_gdmusic
         self.embed_cover = embed_cover
         self._gd = None
+        # (归一化曲名, 归一化歌手) -> pick_metadata 结果，避免同一首歌重复打搜索 API
+        self._gd_track_cache = {}
 
     @property
     def gd(self):
@@ -343,15 +345,46 @@ class FLACMetadataEmbedder:
         return None
 
 
-    def download_gd_lyrics(self, title, artist, save_dir=None):
+    @staticmethod
+    def _pretty_album(name):
+        """搜索返回的专辑名常是全小写（如 `modal soul`），按需转成标题式大小写。
+        已经是混合大小写（如 `Luv(sic) Hexalogy`）的原样保留，避免破坏既有写法。
+        """
+        name = (name or "").strip()
+        if not name:
+            return ""
+        if name.islower() or name.isupper():
+            return " ".join(w[:1].upper() + w[1:] for w in name.split())
+        return name
+
+    def resolve_gd_track(self, title, artist, count=20):
+        """搜索并挑出可信条目，结果按 (title, artist) 缓存。
+
+        一次搜索同时供给「专辑名 / 封面 / 歌词」三处使用，避免同一首歌重复打 API
+        （既省配额，也降低触发站点限流的概率）。失败返回 None。
+        """
+        if not self.use_gdmusic:
+            return None
+        key = (GDMusicClient._norm_key(title), GDMusicClient._norm_key(artist))
+        if key in self._gd_track_cache:
+            return self._gd_track_cache[key]
+        meta = None
+        try:
+            items = self.gd.search(f"{title} {artist}", count=count)
+            meta = self.gd.pick_metadata(items, title, artist)
+        except Exception as e:
+            print(f"⚠️ GD音乐台搜索失败（{title} - {artist}）: {e}")
+        self._gd_track_cache[key] = meta
+        return meta
+
+    def download_gd_lyrics(self, title, artist, save_dir=None, gd_meta=None):
         """GD音乐台歌词兜底：搜索 -> 取 lyric_id -> types=lyric（含 tlyric 翻译）
         返回 (lrc_path, translation)；失败返回 (None, None)
         """
         if not self.use_gdmusic:
             return None, None
         try:
-            items = self.gd.search(f"{title} {artist}", count=20)
-            meta = self.gd.pick_metadata(items, title, artist)
+            meta = gd_meta if gd_meta is not None else self.resolve_gd_track(title, artist)
             if not meta or not meta.get("LyricID"):
                 return None, None
             data = self.gd.lyric(meta["LyricID"])
@@ -370,15 +403,14 @@ class FLACMetadataEmbedder:
             print(f"⚠️ GD音乐台歌词获取失败（{title} - {artist}）: {e}")
             return None, None
 
-    def resolve_cover(self, title, artist):
+    def resolve_cover(self, title, artist, gd_meta=None):
         """解析并下载封面：搜索 -> pick pic_id -> types=pic（尺寸回退）-> 下载字节
         返回封面字节或 None
         """
         if not self.use_gdmusic or not self.embed_cover:
             return None
         try:
-            items = self.gd.search(f"{title} {artist}", count=20)
-            meta = self.gd.pick_metadata(items, title, artist)
+            meta = gd_meta if gd_meta is not None else self.resolve_gd_track(title, artist)
             if not meta or not meta.get("PicID"):
                 print(f"⚠️ 未找到封面（{title} - {artist}）")
                 return None
@@ -405,8 +437,56 @@ class FLACMetadataEmbedder:
                 return parts[0].strip(), parts[1].strip()
         return None, None
 
+    # 已知复合风格：拆分 StyleTag 时不能把它们切成两个词（Lo-fi 不能变 "Lo, fi"）
+    GENRE_COMPOUNDS = (
+        "Lo-Fi", "Hip-Hop", "Trip-Hop", "Future-Bass", "Nu-Disco", "Nu-Jazz",
+        "Post-Rock", "Post-Punk", "Drum-Bass", "Synth-Pop", "Dream-Pop",
+        "Ambient-Pop", "Chill-Wave", "Deep-House", "Tech-House", "Acid-Jazz",
+        "Downtempo", "Nu-Gaze", "Electro-Swing", "Jazzhop",
+    )
+
+    @staticmethod
+    def _has_cjk(text):
+        return any('一' <= ch <= '鿿' for ch in text)
+
+    @classmethod
+    def _style_tag_from_folder(cls, folder_name):
+        """从 `NN-中文描述-StyleTag` 里剥出 ASCII 风格标签段"""
+        parts = []
+        for p in str(folder_name).split("-"):
+            p = p.strip()
+            if not p or p.isdigit() or cls._has_cjk(p):
+                continue
+            parts.append(p)
+        return "-".join(parts)
+
+    @classmethod
+    def derive_genre_from_tag(cls, style_tag):
+        """把 StyleTag（`Jazzhop-Lo-fi-Hip-Hop`）拆成 `Jazzhop, Lo-fi, Hip-Hop`"""
+        tokens = [t for t in re.split(r"[-_\s]+", style_tag or "") if t]
+        if not tokens:
+            return ""
+        lowered = {c.lower() for c in cls.GENRE_COMPOUNDS}
+        merged, i = [], 0
+        while i < len(tokens):
+            if i + 1 < len(tokens) and f"{tokens[i]}-{tokens[i + 1]}".lower() in lowered:
+                merged.append(f"{tokens[i]}-{tokens[i + 1]}")
+                i += 2
+            else:
+                merged.append(tokens[i])
+                i += 1
+        out, seen = [], set()
+        for g in merged:
+            if g.lower() not in seen:
+                seen.add(g.lower())
+                out.append(g)
+        return ", ".join(out)
+
     def get_genre_from_folder(self, folder_name):
-        """根据文件夹名获取风格"""
+        """根据文件夹名获取风格。
+
+        优先级：显式映射表 → 从 StyleTag 推导 → 兜底 Electronic（并告警，不再静默）。
+        """
         genre_mapping = {
             "Synthwave-Chillwave": "Synthwave, Chillwave",
             "Melodic-Future-Bass-Glitch": "Future Bass, Glitch",
@@ -419,6 +499,14 @@ class FLACMetadataEmbedder:
         for key, genre in genre_mapping.items():
             if key in folder_name:
                 return genre
+
+        derived = self.derive_genre_from_tag(self._style_tag_from_folder(folder_name))
+        if derived:
+            print(f"ℹ️  风格标签未在映射表中，按目录名推导: {folder_name} → {derived}")
+            return derived
+
+        print(f"⚠️ 无法从目录名推导风格，回落 Electronic: {folder_name}"
+              f"（建议用 `NN-中文描述-StyleTag` 命名，如 01-梦幻复古合成器-Synthwave）")
         return "Electronic"
 
     def get_album_info(self, artist, genre):
@@ -580,8 +668,32 @@ class FLACMetadataEmbedder:
             return False
 
 
-    def _build_metadata(self, flac_file, folder, playlist, genre, album_info, title, artist):
-        """构建并补全元数据（歌词 / 翻译 / 封面），返回 metadata dict"""
+    @staticmethod
+    def _track_number(playlist, title, artist, default="1"):
+        """按 playlist.json 里的顺序取曲目号；未匹配则回落到 default"""
+        want_t = GDMusicClient._norm_key(title)
+        want_a = GDMusicClient._norm_key(artist)
+        for i, entry in enumerate(playlist or [], start=1):
+            if not isinstance(entry, dict):
+                continue
+            if (GDMusicClient._norm_key(entry.get("title", "")) == want_t
+                    and GDMusicClient._norm_key(entry.get("artist", "")) == want_a):
+                return str(i)
+        return default
+
+    def _build_metadata(self, flac_file, folder, playlist, genre, album_info,
+                        title, artist, gd_meta=None):
+        """构建并补全元数据（专辑 / 歌词 / 翻译 / 封面），返回 metadata dict
+
+        gd_meta 为 resolve_gd_track() 的搜索命中条目；专辑名优先取其中的真实专辑，
+        取不到才回落到「歌手 -> 内置专辑表」的硬编码值。
+        """
+        # 专辑：刮削结果优先，内置表兜底
+        scraped_album = self._pretty_album((gd_meta or {}).get("Album"))
+        album = scraped_album or album_info['album']
+        if scraped_album and scraped_album != album_info['album']:
+            print(f"   专辑: 采用刮削结果 {scraped_album!r}（内置表为 {album_info['album']!r}）")
+
         # 下载歌词（保存到歌曲所在文件夹）
         lyrics_path = self.download_lyrics(title, artist, save_dir=folder)
         lyrics_content = None
@@ -591,23 +703,24 @@ class FLACMetadataEmbedder:
                 lyrics_content = f.read()
         else:
             # GD音乐台歌词兜底（含翻译）
-            gd_path, translation = self.download_gd_lyrics(title, artist, save_dir=folder)
+            gd_path, translation = self.download_gd_lyrics(
+                title, artist, save_dir=folder, gd_meta=gd_meta)
             if gd_path:
                 with open(gd_path, 'r', encoding='utf-8') as f:
                     lyrics_content = f.read()
 
         # 封面
-        cover_data = self.resolve_cover(title, artist)
+        cover_data = self.resolve_cover(title, artist, gd_meta=gd_meta)
 
         return {
             'title': title,
             'artist': artist,
-            'album': album_info['album'],
+            'album': album,
             'albumartist': album_info['albumartist'],
             'composer': album_info['composer'],
             'genre': genre,
             'year': album_info['year'],
-            'track': '1',  # 默认为1，避免匹配问题
+            'track': self._track_number(playlist, title, artist),
             'totaltracks': str(len(playlist)),
             'comment': f'Genre: {genre} | Source: music.gdstudio.org',
             'lyrics': lyrics_content,
@@ -651,10 +764,14 @@ class FLACMetadataEmbedder:
                     failed_files += 1
                     continue
 
-                # 获取专辑信息
+                # 获取专辑信息（内置表兜底用）
                 album_info = self.get_album_info(artist, genre)
 
-                metadata = self._build_metadata(flac_file, folder, playlist, genre, album_info, title, artist)
+                # 一次搜索供专辑名 / 封面 / 歌词共用
+                gd_meta = self.resolve_gd_track(title, artist)
+
+                metadata = self._build_metadata(flac_file, folder, playlist, genre,
+                                                album_info, title, artist, gd_meta=gd_meta)
 
                 # 内嵌元数据
                 if self.embed_metadata(flac_file, metadata):
@@ -673,8 +790,8 @@ class FLACMetadataEmbedder:
 
 def main():
     parser = argparse.ArgumentParser(description='FLAC文件元数据内嵌工具')
-    parser.add_argument('--downloads-dir', default='/Users/tommydu/Documents/automatic downloading music',
-                       help='下载目录路径')
+    parser.add_argument('--downloads-dir', default=str(Path.cwd()),
+                       help='下载目录路径（默认当前工作目录，需其下含 downloads/0* 风格文件夹）')
     parser.add_argument('--single-file', help='处理单个文件')
     parser.add_argument('--list-genres', action='store_true', help='列出所有风格')
     parser.add_argument('--gd-source', default='netease',
@@ -719,11 +836,13 @@ def main():
             print(f"无法解析文件名: {flac_path.name}")
             return
 
-        genre = "Electronic"  # 默认
+        # 风格同样按所在目录推导，不再一律写死 Electronic
+        genre = embedder.get_genre_from_folder(flac_path.parent.name)
         album_info = embedder.get_album_info(artist, genre)
+        gd_meta = embedder.resolve_gd_track(title, artist)
 
         metadata = embedder._build_metadata(
-            flac_path, flac_path.parent, [], genre, album_info, title, artist
+            flac_path, flac_path.parent, [], genre, album_info, title, artist, gd_meta=gd_meta
         )
         metadata['totaltracks'] = '1'
 
