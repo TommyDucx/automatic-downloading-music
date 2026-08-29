@@ -186,7 +186,7 @@ python3 flac_metadata_embedder.py --single-file "path/to/song.flac"
 - `DATE/COMPOSER`：仍按歌手查内置表 —— ⚠️ 搜索接口不返回年份，所以 DATE 是**歌手级近似值**，
   一首歌跨专辑时可能不准（已知局限，暂无数据源可修）
 - `TRACKNUMBER`：在 playlist.json 中的序号；未匹配默认 1
-- `LYRICS`：syncedlyrics 搜索，失败换 `https://api.lrc.cx/api/v1/lyrics/single`；再失败走 GD音乐台 `types=lyric` 兜底；**先写 lrc 文件到歌曲文件夹，再读内容内嵌**
+- `LYRICS`：syncedlyrics 搜索（**固定 providers = Lrclib,NetEase**），失败换 `https://api.lrc.cx/api/v1/lyrics/single`；再失败走 GD音乐台 `types=lyric` 兜底；**先写 lrc 文件到歌曲文件夹，再读内容内嵌**
 - `LYRICS_TRANSLATED`：GD音乐台 `types=lyric` 返回的 `tlyric` 翻译歌词
 - **封面（PICTURE）**：GD音乐台搜索 -> 取 `pic_id` -> `types=pic`（尺寸 1000/640/500/300 回退）-> 带 Referer 下载 -> `metaflac --import-picture-from` 内嵌
 - 歌词入 Vorbis 注释前需清洗：去掉 `[00:00.00]` 时间戳行与元信息行（`作曲:` `作词:` 等），否则 `--import-tags-from` 会报 malformed vorbis comment
@@ -203,6 +203,39 @@ python3 flac_metadata_embedder.py --single-file "path/to/song.flac"
 - **不要**用 `--import-tags-from <lrc>` 直接导入歌词（时间戳行非法），要用 `--set-tag "LYRICS=<清洗后文本>"`
 - 文件名非 `歌手 - 歌名` 格式（如纯中文歌名）解析不到歌手/歌名，会跳过 → 手动改名或单独补元数据
 - 封面内嵌前必须 `metaflac --remove --block-type=PICTURE` 清掉旧封面，否则重复堆积
+
+### 非 FLAC 音频：用 `download_lyrics.py` 单独补歌词
+
+`flac_metadata_embedder.py` 依赖 metaflac，**只能处理 FLAC**。
+要给 mp3 / m4a / aac / ogg / wav / wma 补歌词，用 `download_lyrics.py`
+（只写 `.lrc` 文件，不改动音频本身）：
+
+```bash
+# 批量：递归扫目录，在每个音频旁生成同名 .lrc（已存在则跳过）
+python3 download_lyrics.py "<目录>" --delay 0.4
+
+# 单曲
+python3 download_lyrics.py --title "Blinding Lights" --artist "The Weeknd" --out "<目录>"
+python3 download_lyrics.py --song "Taylor Swift - Fortnight" --out ./
+```
+
+参数：
+- `--force`：已有 .lrc 也重新下载
+- `--plain-ok`：同步歌词找不到时接受纯文本（默认只要带 `[mm:ss.xx]` 的同步歌词）
+- `--providers`：默认 `Lrclib,NetEase`（中英文覆盖好）
+- `--lang zh`：中文歌词优先
+- `--delay N`：批量模式每首之间的间隔秒数（默认 0.4）
+
+行为约定（脚本内已固化，不要改）：
+- 文件名解析不出「歌手 - 歌名」时回落到内嵌标签（需 `pip install mutagen`，可选）
+- **找不到就如实报告，绝不编造歌词，也不写空文件污染目录**
+- 结束后打印每个 `.lrc` 的完整绝对路径
+
+> ⚠️ **歌词源必须限定 providers**。不指定时 `syncedlyrics` 会遍历全部源，
+> 其中 Musixmatch / Genius / Megalobiz 在受限网络下会逐个超时，拖到整个调用返回 `None`。
+> `flac_metadata_embedder.py` 里已固定为 `LYRIC_PROVIDERS = ["Lrclib", "NetEase"]`。
+> 纯音乐（如 Nujabes 大部分曲目）本来就没有歌词，找不到是正常的，会走 GD `types=lyric` 兜底
+> （返回的常是「纯音乐，请欣赏」这类占位文本，属预期）。
 
 ## 步骤 4：验证
 
@@ -442,7 +475,8 @@ python flac_metadata_embedder.py
 | `gd-flac-downloader.js` | 批量下载器（Node，零依赖，内置签名+防限流+断点续传） |
 | `gd-international-downloader.js` | 国际版下载器（支持网易云音乐、酷我音乐） |
 | `run_all.sh` | 顺序跑所有风格文件夹的下载驱动 |
-| `flac_metadata_embedder.py` | 元数据+歌词内嵌（Python + metaflac） |
+| `flac_metadata_embedder.py` | 元数据+歌词+封面内嵌（Python + metaflac，**仅 FLAC**） |
+| `download_lyrics.py` | 给**非 FLAC**（mp3/m4a/aac/ogg/wav/wma）单独补 `.lrc`，只写文件不改音频 |
 | `playlist.json` | 每风格文件夹内歌单 |
 
 ## 版权提醒

@@ -287,6 +287,10 @@ class GDMusicClient:
 
 
 class FLACMetadataEmbedder:
+    # 歌词源：Lrclib（西语/通用）+ NetEase（中文）。
+    # 不列 Musixmatch / Genius / Megalobiz——它们在受限网络下几乎必然超时。
+    LYRIC_PROVIDERS = ["Lrclib", "NetEase"]
+
     def __init__(self, downloads_dir, gd_source="netease", use_gdmusic=True, embed_cover=True):
         self.downloads_dir = Path(downloads_dir)
         self.gd_source = gd_source
@@ -320,7 +324,15 @@ class FLACMetadataEmbedder:
             import syncedlyrics
 
         query = f"{title} {artist}"
-        lrc_content = syncedlyrics.search(query)
+        # 必须指定 providers：不指定时 syncedlyrics 会遍历全部源，
+        # 其中 Musixmatch / Genius / Megalobiz 在受限网络下会逐个超时，
+        # 拖到整体返回 None（实测：指定 Lrclib,NetEase 后能正常拿到同步歌词）。
+        lrc_content = None
+        try:
+            lrc_content = syncedlyrics.search(
+                query, synced_only=True, providers=self.LYRIC_PROVIDERS)
+        except Exception as e:
+            print(f"   ⚠️ syncedlyrics 搜索异常（{title} - {artist}）: {e}")
 
         if not lrc_content:
             # 尝备用API
