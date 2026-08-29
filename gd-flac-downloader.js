@@ -30,7 +30,8 @@
  *   --sources netease,joox,tencent,qobuz,migu,kuwo  搜索音源优先级
  *   --out <目录>                                    默认 ./downloads
  *   --delay <秒>                                    请求间隔，默认 3（站点限流严格，请勿调太小）
- *   --fallback                                      无 FLAC 时降级保存 320k MP3
+ *   --lossless-only                                 只要无损；拿不到就报失败（默认是接受有损里最高品质那份）
+ *   --fallback                                      兼容别名，现为默认行为（等价于不传 --lossless-only）
  *   --max <n>                                       最多下载前 n 首（歌单导入时限制数量）
  *   --force                                         已存在也重新下载
  */
@@ -67,7 +68,9 @@ function parseArgs(argv) {
     sources: ["netease", "tencent", "kuwo", "joox", "qobuz"],
     out: path.join(process.cwd(), "downloads"),
     delay: 4,
-    fallback: false,
+    // 默认「品质优先」：没有无损就接受有损里最高品质的那份。
+    // 传 --lossless-only 才退回「必须无损」。--fallback 保留为兼容别名（现在已是默认行为）。
+    fallback: true,
     force: false,
     list: null,
     playlist: null,
@@ -112,7 +115,12 @@ function parseArgs(argv) {
         cfg.max = parseInt(next(), 10);
         break;
       case "--fallback":
-        cfg.fallback = true;
+        cfg.fallback = true; // 兼容别名：如今已是默认行为
+        break;
+      case "--lossless-only":
+      case "--flac-only":
+      case "--no-fallback":
+        cfg.fallback = false;
         break;
       case "--force":
         cfg.force = true;
@@ -453,6 +461,17 @@ function extOf(url, br) {
   return ext;
 }
 
+const LOSSLESS_EXTS = new Set(["flac", "ape", "alac", "wav", "aiff"]);
+
+function isLosslessStream(stream, ext) {
+  return LOSSLESS_EXTS.has(ext) || Number(stream.br) > 320;
+}
+
+/** 品质排序分：无损永远压过有损，同档内比码率 */
+function qualityScore(stream, ext) {
+  return (isLosslessStream(stream, ext) ? 1e6 : 0) + (Number(stream.br) || 0);
+}
+
 async function downloadOne(query, index, total) {
   const label = `${query.artist ? `${query.artist} - ${query.title}` : query.title}`;
   console.log(`\n[${index}/${total}] 下载: ${label}`);
@@ -522,18 +541,26 @@ async function downloadOne(query, index, total) {
       continue;
     }
     const ext = extOf(stream.url, stream.br);
-    const isLossless = ext === "flac" || ext === "ape" || ext === "alac" || stream.br > 320;
+    const isLossless = isLosslessStream(stream, ext);
     const degradeNote = stream.degraded ? `（已从 ${CFG.br} 降级）` : "";
     console.log(`   ${src}: 获得 ${ext.toUpperCase()} ${stream.br || "?"}kbps${degradeNote} ${stream.size ? Math.round(stream.size / 1048576) + "MB" : ""}`);
     if (isLossless) {
       chosen = { track, src, stream };
-      break; // 拿到无损即停
+      break; // 拿到无损即停（省配额）
     }
     if (!CFG.fallback) {
-      console.log(`   ${src}: 仅 ${ext.toUpperCase()}（非无损），且未开启 --fallback，尝试下一音源`);
+      console.log(`   ${src}: 仅 ${ext.toUpperCase()}（非无损），且指定了 --lossless-only，尝试下一音源`);
       continue;
     }
-    chosen = { track, src, stream }; // 允许降级，但继续找更高品质的
+    // 保留有损候选里**品质最高**的那份：此前是直接覆盖，导致后一个音源
+    // 即使码率更低也会顶替掉前面更好的（与「高→低」的优先级相违背）。
+    const cand = { track, src, stream, score: qualityScore(stream, ext) };
+    if (!chosen || cand.score > chosen.score) {
+      chosen = cand;
+      console.log(`   ${src}: 记为有损候选（${ext.toUpperCase()} ${stream.br || "?"}kbps），继续找更高品质`);
+    } else {
+      console.log(`   ${src}: ${ext.toUpperCase()} ${stream.br || "?"}kbps 不如现有候选，跳过`);
+    }
   }
 
   if (!chosen) {
@@ -634,7 +661,7 @@ let RUNTIME = null;
   }
   RUNTIME = await ensureRuntime();
   console.log(`[i] 站点: https://${CFG.host}  音质: br=${CFG.br}${CFG.strictBr ? "（不降级）" : `（可降至 ${CFG.brMin}）`}  音源顺序: ${CFG.sources.join(", ")}`);
-  console.log(`[i] 输出目录: ${CFG.out}   请求间隔: ${CFG.delay}s${CFG.fallback ? "   允许降级MP3" : ""}`);
+  console.log(`[i] 输出目录: ${CFG.out}   请求间隔: ${CFG.delay}s   ${CFG.fallback ? "品质优先（无无损时取有损最高档）" : "仅无损"}`);
 
   let ok = 0;
   let fail = 0;

@@ -311,31 +311,49 @@ class FLACMetadataEmbedder:
         import re
         return re.sub(r'[\\/*?:"<>|]', "", text).strip()
 
-    def download_lyrics(self, title, artist, save_dir=None):
-        """下载同步歌词，保存到歌曲所在文件夹
-        save_dir: 歌词保存目录（缺省为歌曲所在文件夹）
-        """
-        save_dir = Path(save_dir) if save_dir else None
-        try:
-            import syncedlyrics
-        except ImportError:
-            print("syncedlyrics 未安装，正在安装...")
-            subprocess.run([sys.executable, "-m", "pip", "install", "syncedlyrics"])
-            import syncedlyrics
+    @staticmethod
+    def _lyric_fetcher():
+        """取同目录 download_lyrics.py 的 fetch_lyrics，失败返回 None（调用方走后续兜底）。
 
-        query = f"{title} {artist}"
-        # 必须指定 providers：不指定时 syncedlyrics 会遍历全部源，
-        # 其中 Musixmatch / Genius / Megalobiz 在受限网络下会逐个超时，
-        # 拖到整体返回 None（实测：指定 Lrclib,NetEase 后能正常拿到同步歌词）。
-        lrc_content = None
+        歌词抓取统一委托出去，避免与 download_lyrics.py 两套实现漂移。
+        注意 download_lyrics.py 缺 syncedlyrics 时会 sys.exit()，所以要连带捕获 SystemExit。
+        """
         try:
-            lrc_content = syncedlyrics.search(
-                query, synced_only=True, providers=self.LYRIC_PROVIDERS)
-        except Exception as e:
-            print(f"   ⚠️ syncedlyrics 搜索异常（{title} - {artist}）: {e}")
+            here = str(Path(__file__).resolve().parent)
+            if here not in sys.path:
+                sys.path.insert(0, here)
+            from download_lyrics import fetch_lyrics
+            return fetch_lyrics
+        except (Exception, SystemExit) as e:
+            print(f"   ⚠️ 无法加载 download_lyrics.py（{e}），歌词将走后续兜底")
+            return None
+
+    def download_lyrics(self, title, artist, save_dir=None, audio_path=None):
+        """下载同步歌词，保存到歌曲所在文件夹。
+
+        抓取逻辑委托 download_lyrics.py（providers=Lrclib,NetEase、sync 优先、绝不编造），
+        抓不到再依次回落 lrc.cx → GD音乐台 types=lyric。
+
+        save_dir:   歌词保存目录（缺省为 downloads 根）
+        audio_path: 给出时 .lrc 用「音频同名」命名（与 download_lyrics.py 目录模式一致，
+                    播放器可按同名自动匹配）；否则退回 `歌手 - 歌名.lrc`
+        """
+        save_dir = Path(save_dir) if save_dir else self.downloads_dir
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        lrc_content = None
+        fetch = self._lyric_fetcher()
+        if fetch:
+            try:
+                text, _synced = fetch(
+                    artist, title, providers=self.LYRIC_PROVIDERS, plain_ok=False)
+                if text:
+                    lrc_content = text
+            except Exception as e:
+                print(f"   ⚠️ 歌词抓取异常（{title} - {artist}）: {e}")
 
         if not lrc_content:
-            # 尝备用API
+            # 备用 API
             try:
                 resp = requests.get(
                     "https://api.lrc.cx/api/v1/lyrics/single",
@@ -344,17 +362,20 @@ class FLACMetadataEmbedder:
                 )
                 if resp.status_code == 200:
                     lrc_content = resp.text
-            except:
+            except Exception:
                 pass
 
-        if lrc_content:
-            fn = self.safe_filename(f"{artist}-{title}.lrc")
-            full_path = save_dir / fn if save_dir else self.downloads_dir / fn
-            save_dir.mkdir(parents=True, exist_ok=True)
-            with open(full_path, "w", encoding="utf-8") as f:
-                f.write(lrc_content)
-            return str(full_path)
-        return None
+        if not lrc_content:
+            return None
+
+        if audio_path is not None:
+            full_path = Path(audio_path).with_suffix(".lrc")
+        else:
+            fn = self.safe_filename(f"{artist} - {title}.lrc")
+            full_path = save_dir / fn
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(lrc_content)
+        return str(full_path)
 
 
     @staticmethod
@@ -389,9 +410,12 @@ class FLACMetadataEmbedder:
         self._gd_track_cache[key] = meta
         return meta
 
-    def download_gd_lyrics(self, title, artist, save_dir=None, gd_meta=None):
+    def download_gd_lyrics(self, title, artist, save_dir=None, gd_meta=None, audio_path=None):
         """GD音乐台歌词兜底：搜索 -> 取 lyric_id -> types=lyric（含 tlyric 翻译）
         返回 (lrc_path, translation)；失败返回 (None, None)
+
+        audio_path 给出时 .lrc 与音频同名，与 download_lyrics() / download_lyrics.py
+        保持一致——否则同一首歌会被两条路径写出两份命名不同的 .lrc。
         """
         if not self.use_gdmusic:
             return None, None
@@ -405,8 +429,10 @@ class FLACMetadataEmbedder:
                 return None, None
             save_dir = Path(save_dir) if save_dir else self.downloads_dir
             save_dir.mkdir(parents=True, exist_ok=True)
-            fn = self.safe_filename(f"{artist}-{title}.lrc")
-            path = save_dir / fn
+            if audio_path is not None:
+                path = Path(audio_path).with_suffix(".lrc")
+            else:
+                path = save_dir / self.safe_filename(f"{artist} - {title}.lrc")
             with open(path, "w", encoding="utf-8") as f:
                 f.write(lrc)
             translation = (data.get("tlyric") or "").strip()
@@ -706,8 +732,8 @@ class FLACMetadataEmbedder:
         if scraped_album and scraped_album != album_info['album']:
             print(f"   专辑: 采用刮削结果 {scraped_album!r}（内置表为 {album_info['album']!r}）")
 
-        # 下载歌词（保存到歌曲所在文件夹）
-        lyrics_path = self.download_lyrics(title, artist, save_dir=folder)
+        # 下载歌词（保存到歌曲所在文件夹，.lrc 与音频同名）
+        lyrics_path = self.download_lyrics(title, artist, save_dir=folder, audio_path=flac_file)
         lyrics_content = None
         translation = None
         if lyrics_path:
@@ -716,7 +742,7 @@ class FLACMetadataEmbedder:
         else:
             # GD音乐台歌词兜底（含翻译）
             gd_path, translation = self.download_gd_lyrics(
-                title, artist, save_dir=folder, gd_meta=gd_meta)
+                title, artist, save_dir=folder, gd_meta=gd_meta, audio_path=flac_file)
             if gd_path:
                 with open(gd_path, 'r', encoding='utf-8') as f:
                     lyrics_content = f.read()

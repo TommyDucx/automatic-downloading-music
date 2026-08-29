@@ -34,7 +34,12 @@ downloads/
 
 ## 规则：歌词与歌曲同文件夹
 
-**歌词文件必须保存在歌曲所在文件夹内，与音频文件同目录**（命名 `歌手-歌名.lrc`），不得放在独立的总 lyrics 目录。
+**歌词文件必须保存在歌曲所在文件夹内，与音频文件同目录，且与音频同名**
+（`Nujabes - Battlecry.flac` → `Nujabes - Battlecry.lrc`），不得放在独立的总 lyrics 目录。
+
+> ⚠️ 命名已从 `歌手-歌名.lrc` 改为**与音频同名**。同名才是播放器自动匹配的前提；
+> 两条歌词路径（`flac_metadata_embedder.py` 与 `download_lyrics.py`）现在都用这一套命名，
+> 否则同一首歌会被写出两份命名不同的 .lrc。
 
 原因：方便单文件夹整体拷贝/同步，播放器按目录读取歌词时无需额外配置。
 
@@ -82,16 +87,20 @@ node gd-flac-downloader.js --playlist "https://music.163.com/playlist?id=xxx" --
 
 ```bash
 node gd-flac-downloader.js --list <playlist.json> --out <歌曲文件夹> \
-  --sources netease,joox --delay 4 --fallback
+  --sources netease,joox --delay 4
+# 只收无损（没有 FLAC 就报失败，不降级）：加 --lossless-only
 ```
 
 参数：
 - `--sources`：netease,joox,tencent,kuwo,migu,qobuz,spotify,apple,ytmusic（逗号分隔）
 - `--delay`：请求间隔秒数；默认 3，批量下载务必 ≥4
-- `--fallback`：允许降级 MP3
 - `--br 999|740|320`：目标音质，默认 999（24bit FLAC）
 - `--br-min 320`：音质降级链下限，默认 128。**降级链**：目标 br 拿不到时自动逐档向下试（999→740→320→192→128），同一音源内先降级再换源，借鉴 EchoMusic resolver 的候选降级思路
 - `--strict-br`：关闭降级，目标 br 拿不到就直接换下一音源
+- **格式优先级（默认行为）**：没有无损就存有损里**品质最高**的那份，扩展名按实际格式落盘
+  （`.flac` / `.mp3` / `.m4a` / `.ogg`…）。评分 = 无损 +1e6 + 码率，跨音源择优，不是「最后一个说了算」
+- `--lossless-only`（别名 `--flac-only` / `--no-fallback`）：**只要无损**，拿不到就报失败。
+  想严格只收 FLAC 时用它；`--fallback` 保留为兼容别名，如今已是默认行为
 - `--playlist <链接>`：歌单链接直导（网易云/QQ/Spotify/酷狗），免手动写 JSON
 - `--max <n>`：最多下载前 n 首（歌单很大时限制数量）
 - `--force`：已存在也重新下载；不传则已存在文件直接跳过（不耗 API 配额）
@@ -131,7 +140,8 @@ node gd-international-downloader.js "周杰伦" netease 999 5 cn     # 手动指
 主站签名：`/time` 拿时间戳 → VM 跑 `crc32.min.js` 对 `encodeURIComponent(name)` 求 crc32 → 拼 `s=` 参数
 POST `/api.php`，`Content-Type: application/x-www-form-urlencoded`，需 UA / X-Requested-With 头
 API 返回 `{songname, artist, album, url, br, size, source, lrc}`；`url` 为需二次请求的真实下载地址
-下载音质优先级按 `br` 排序（999=FLAC，越高越好），`--fallback` 时无无损也可降级 MP3
+下载音质优先级按 `br` 排序（999=FLAC，越高越好）；**默认**无无损时也会接受有损里最高品质那份
+（要严格只收无损请加 `--lossless-only`）
 
 国际版签名：`s = crc32Hex(encodeURIComponent(name 或 id))`，POST form 到 `<mirror>/api.php`；
 限流口径约 50 次/5 分钟，遇 401 自动指数退避重试。
