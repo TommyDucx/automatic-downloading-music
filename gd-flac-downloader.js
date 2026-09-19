@@ -55,12 +55,26 @@ const API_HEADERS = {
   "X-Requested-With": "XMLHttpRequest",
 };
 
+// 纯 JS 标准 CRC32（多项式 0xEDB88320），站点前端 crc32.min.js 已失效，改用内置实现。
+// 签名 = crc32Hex(encodeURIComponent(name 或 id))，与国际版 API（music-api.gdstudio.xyz）一致。
+function pureCrc32(input) {
+  let c = ~0 >>> 0;
+  for (let i = 0; i < input.length; i++) {
+    c ^= input.charCodeAt(i);
+    for (let j = 0; j < 8; j++) c = (c >>> 1) ^ (0xEDB88320 & -(c & 1));
+  }
+  return (~c) >>> 0;
+}
+function crc32Hex(input) {
+  return pureCrc32(input).toString(16).toUpperCase().padStart(8, "0");
+}
+
 // ---------------------------------------------------------------------------
 // 参数解析
 // ---------------------------------------------------------------------------
 function parseArgs(argv) {
   const cfg = {
-    host: "music.gdstudio.org",
+    host: "music-api.gdstudio.xyz",
     proxy: process.env.GD_PROXY || null,
     br: 999,
     brMin: 128,
@@ -209,12 +223,15 @@ async function ensureRuntime() {
     return false;
   }
   if (!fs.existsSync(crcFile) || !fs.existsSync(playerFile) || !fs.existsSync(s2tFile)) {
-    console.log("[i] 首次运行，正在获取站点前端脚本（用于签名/简繁转换）…");
     const base = `https://${CFG.host}`;
     const ok1 = await fetchTo(`${base}/js/crc32.min.js`, crcFile);
     const ok2 = await fetchTo(`${base}/js/player.js`, playerFile);
     const ok3 = await fetchTo(`${base}/js/chinese-s2t.js`, s2tFile);
-    if (!ok1 || !ok2 || !ok3) throw new Error(`无法获取前端脚本，请检查 ${base} 是否可访问`);
+    if (!ok1 || !ok2 || !ok3) {
+      // 站点前端脚本（crc32.min.js 等）已不可用；签名改用内置纯 JS CRC32，仅损失简繁转换。
+      console.log("[i] 前端脚本获取失败，改用内置纯 JS 签名（不影响下载，仅简繁转换不可用）。");
+      return { crc32Src: "", version: "0", s2t: null };
+    }
   }
   const playerSrc = fs.readFileSync(playerFile, "utf8");
   const m = playerSrc.match(/version\s*:\s*"([\d.]+)"/);
@@ -257,21 +274,13 @@ function makeVm(crc32Src, host, ts) {
   return ctx;
 }
 
-async function fetchTime() {
-  const r = await httpFetch(`https://${CFG.host}/time`, { method: "GET" });
-  const txt = (await r.text()).trim();
-  const t = parseInt(txt, 10);
-  if (!Number.isFinite(t)) throw new Error(`/time 返回异常: ${txt}`);
-  return t;
-}
-
 async function apiCall(params, depth) {
   // params: { types, source?, name?|id?, br?, pages?, count? }
   depth = depth || 0;
-  const ts = await fetchTime();
-  const ctx = makeVm(RUNTIME.crc32Src, CFG.host, ts);
+  // 注：国际版 API（music-api.gdstudio.xyz）签名仅用 id/name 的 CRC32，
+  // 不需要 /time 时间戳；去掉 fetchTime 调用可避免触发站点 Cloudflare 挑战。
   const signInput = encodeURIComponent(String(params.id !== undefined ? params.id : params.name || ""));
-  const s = ctx.crc32(String(signInput));
+  const s = crc32Hex(signInput);
   // 关键：组装成「预编码一次」的原始表单字符串，避免二次编码
   const parts = [];
   for (const [k, v] of Object.entries(params)) {
@@ -499,7 +508,9 @@ async function downloadOne(query, index, total) {
     }
   }
 
-  let chosen = null; // { track, src, stream }
+  // 候选队列：跨音源收集**全部**可用流，下载阶段按品质从高到低依次尝试。
+  // （此前只保留一个最优候选，最优那份 404 / 校验失败时整首歌就失败，不会回退到次优）
+  const candidates = []; // [{ track, src, stream, score }]
   // ---- 多源 resolve/transform 管道（借鉴 EchoMusic audioSource 管道思想）----
   // resolve 阶段：按 CFG.sources 顺序逐源搜索匹配出曲目（候选源队列）
   // transform 阶段：取流（含音质降级链 br→brMin）、过滤无版权/非无损，失败换下一源
@@ -545,52 +556,61 @@ async function downloadOne(query, index, total) {
     const degradeNote = stream.degraded ? `（已从 ${CFG.br} 降级）` : "";
     console.log(`   ${src}: 获得 ${ext.toUpperCase()} ${stream.br || "?"}kbps${degradeNote} ${stream.size ? Math.round(stream.size / 1048576) + "MB" : ""}`);
     if (isLossless) {
-      chosen = { track, src, stream };
+      candidates.push({ track, src, stream, score: qualityScore(stream, ext) });
       break; // 拿到无损即停（省配额）
     }
     if (!CFG.fallback) {
       console.log(`   ${src}: 仅 ${ext.toUpperCase()}（非无损），且指定了 --lossless-only，尝试下一音源`);
       continue;
     }
-    // 保留有损候选里**品质最高**的那份：此前是直接覆盖，导致后一个音源
-    // 即使码率更低也会顶替掉前面更好的（与「高→低」的优先级相违背）。
-    const cand = { track, src, stream, score: qualityScore(stream, ext) };
-    if (!chosen || cand.score > chosen.score) {
-      chosen = cand;
-      console.log(`   ${src}: 记为有损候选（${ext.toUpperCase()} ${stream.br || "?"}kbps），继续找更高品质`);
-    } else {
-      console.log(`   ${src}: ${ext.toUpperCase()} ${stream.br || "?"}kbps 不如现有候选，跳过`);
-    }
+    // 全部收进候选队列，最终按 qualityScore 排序（无损 +1e6 + 码率）后再逐个尝试下载。
+    // 这样「高→低」的优先级由排序保证，也顺带修掉了最优候选 404 时无法回退的问题。
+    candidates.push({ track, src, stream, score: qualityScore(stream, ext) });
+    console.log(`   ${src}: 记为候选（${ext.toUpperCase()} ${stream.br || "?"}kbps），继续找更高品质`);
   }
 
-  if (!chosen) {
+  if (candidates.length === 0) {
     console.log(`[x] 未能为「${label}」找到可用音源`);
     return false;
   }
 
-  const { track, src, stream } = chosen;
-  const ext = extOf(stream.url, stream.br);
-  const file = path.join(CFG.out, `${safeBase}.${ext}`);
-  fs.mkdirSync(CFG.out, { recursive: true });
-  console.log(`   下载中: ${stream.url.split("?")[0].split("/").pop()}`);
-  const size = await downloadFile(stream.url, file);
-  const magic = fs.readFileSync(file).subarray(0, 4).toString("ascii");
-  const ok = ext === "flac" ? magic.startsWith("fLaC") : ext === "mp3" ? magic.startsWith("ID3") || (fs.readFileSync(file)[0] === 0xff) : true;
-  if (!ok) {
-    console.log(`[!] 文件校验失败（魔数 ${JSON.stringify(magic)} 不是 ${ext}），删除重下…`);
-    fs.unlinkSync(file);
-    return false;
+  // 品质从高到低依次尝试下载：任一候选 404 / 魔数校验失败就回退到次优
+  candidates.sort((a, b) => b.score - a.score);
+  if (candidates.length > 1) {
+    console.log(`   [i] 共 ${candidates.length} 个候选，按品质 ${candidates.map((c) => c.src + (c.stream.br ? ":" + c.stream.br : "")).join(" > ")} 依次尝试`);
   }
-  // 写回下载索引（本地缓存兜底）：下次同歌名直接跳过，不消耗搜索/取流配额
-  try {
-    const indexFile = path.join(CFG.out, ".downloaded.json");
-    let idx = {};
-    try { idx = JSON.parse(fs.readFileSync(indexFile, "utf8")); } catch {}
-    idx[safeBase] = { file: path.basename(file), src, br: stream.br ?? null, size, time: Date.now() };
-    fs.writeFileSync(indexFile, JSON.stringify(idx, null, 2));
-  } catch {}
-  console.log(`[+] 完成 (${src} ${ext.toUpperCase()}): ${file} (${Math.round(size / 1048576)}MB)`);
-  return true;
+
+  let lastErr = null;
+  for (let ci = 0; ci < candidates.length; ci++) {
+    const { src, stream } = candidates[ci];
+    const ext = extOf(stream.url, stream.br);
+    const file = path.join(CFG.out, `${safeBase}.${ext}`);
+    fs.mkdirSync(CFG.out, { recursive: true });
+    try {
+      console.log(`   下载中: ${stream.url.split("?")[0].split("/").pop()}`);
+      const size = await downloadFile(stream.url, file);
+      const magic = fs.readFileSync(file).subarray(0, 4).toString("ascii");
+      const ok = ext === "flac" ? magic.startsWith("fLaC") : ext === "mp3" ? magic.startsWith("ID3") || (fs.readFileSync(file)[0] === 0xff) : true;
+      if (!ok) throw new Error(`文件校验失败（魔数 ${JSON.stringify(magic)} 不是 ${ext}）`);
+      // 写回下载索引（本地缓存兜底）：下次同歌名直接跳过，不消耗搜索/取流配额
+      try {
+        const indexFile = path.join(CFG.out, ".downloaded.json");
+        let idx = {};
+        try { idx = JSON.parse(fs.readFileSync(indexFile, "utf8")); } catch {}
+        idx[safeBase] = { file: path.basename(file), src, br: stream.br ?? null, size, time: Date.now() };
+        fs.writeFileSync(indexFile, JSON.stringify(idx, null, 2));
+      } catch {}
+      console.log(`[+] 完成 (${src} ${ext.toUpperCase()}): ${file} (${Math.round(size / 1048576)}MB)`);
+      return true;
+    } catch (e) {
+      lastErr = e;
+      try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch {}
+      console.log(`[!] 候选 ${ci + 1}/${candidates.length}（${src} ${ext.toUpperCase()}）下载失败：${e.message}`);
+      if (ci < candidates.length - 1) console.log(`    回退到次优候选…`);
+    }
+  }
+  console.log(`[x] 全部候选均失败：${lastErr ? lastErr.message : "未知错误"}`);
+  return false;
 }
 
 // ---------------------------------------------------------------------------

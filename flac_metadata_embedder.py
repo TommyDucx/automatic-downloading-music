@@ -467,10 +467,10 @@ class FLACMetadataEmbedder:
 
 
     def get_metadata_from_filename(self, filename):
-        """从文件名解析歌手和歌名"""
-        # 处理格式：歌手 - 歌名.flac
-        if " - " in filename:
-            parts = filename.replace(".flac", "").split(" - ", 1)
+        """从文件名解析歌手和歌名（歌手 - 歌名.flac/.mp3/...）"""
+        stem = Path(filename).stem
+        if " - " in stem:
+            parts = stem.split(" - ", 1)
             if len(parts) == 2:
                 return parts[0].strip(), parts[1].strip()
         return None, None
@@ -481,6 +481,8 @@ class FLACMetadataEmbedder:
         "Post-Rock", "Post-Punk", "Drum-Bass", "Synth-Pop", "Dream-Pop",
         "Ambient-Pop", "Chill-Wave", "Deep-House", "Tech-House", "Acid-Jazz",
         "Downtempo", "Nu-Gaze", "Electro-Swing", "Jazzhop",
+        "Boom-Bap", "Jazz-Rap", "G-Funk", "West-Coast",
+        "Emo-Phonk", "Drift-Phonk", "Emo-Rap", "Hyperpop", "Cloud-Rap",
     )
 
     @staticmethod
@@ -531,7 +533,8 @@ class FLACMetadataEmbedder:
             "Chillhop-Lofi-Synth-Electronica": "Chillhop, Lo-fi, Electronic",
             "Folktronica-Ambient-Pop": "Folktronica, Ambient, Pop",
             "Space-Ambient-Modular-Synth": "Space, Ambient, Modular Synth",
-            "Emotional-Synth-Melancholy": "Emotional Synth, Melancholy"
+            "Emotional-Synth-Melancholy": "Emotional Synth, Melancholy",
+            "Emo-Phonk": "Phonk, Emo Rap, 意境说唱",
         }
 
         for key, genre in genre_mapping.items():
@@ -618,13 +621,40 @@ class FLACMetadataEmbedder:
         text = ' '.join(cleaned)
         return text[:max_len]
 
+    @staticmethod
+    def _normalize_cover_jpeg(data, max_size=1000):
+        """把任意封面字节归一化为 JPEG（RGB、可选缩放到 max_size）。
+
+        山灵等播放器只认 JPEG 封面，PNG 会被显示为「无封面」；GD 个别音源返回的就是
+        PNG，故在写入前统一转格式，从源头杜绝 PNG 封面复发。转换失败则原样返回。
+        """
+        if not data:
+            return data
+        try:
+            from io import BytesIO
+            from PIL import Image
+        except Exception:
+            return data
+        try:
+            img = Image.open(BytesIO(data))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            if max(img.size) > max_size:
+                img.thumbnail((max_size, max_size))
+            buf = BytesIO()
+            img.save(buf, "JPEG", quality=90)
+            return buf.getvalue()
+        except Exception:
+            return data
+
     def embed_metadata(self, flac_path, metadata):
         """使用 metaflac 内嵌元数据（封面先处理，标签最后写，避免 PICTURE 重写影响标签）"""
         try:
             flac_path = str(flac_path)
 
             # 封面内嵌（先清旧 PICTURE 再导入；此步会重写文件，故标签放到最后再写）
-            cover_data = metadata.get("cover_data")
+            # 写入前统一归一化为 JPEG，避免个别音源返回的 PNG 封面在山灵上不显示
+            cover_data = self._normalize_cover_jpeg(metadata.get("cover_data"))
             if cover_data:
                 cover_tmp = None
                 try:
@@ -702,6 +732,58 @@ class FLACMetadataEmbedder:
 
         except Exception as e:
             print(f"❌ 元数据内嵌异常: {flac_path}")
+            print(f"错误: {e}")
+            return False
+
+    def embed_metadata_mp3(self, mp3_path, metadata):
+        """使用 mutagen 内嵌 MP3 元数据（封面 APIC + 基本 ID3 标签）。
+        FLAC 之外的有损格式（如本次降级拿到的 MP3 320）也能在播放器显示专辑封面。"""
+        try:
+            from mutagen.mp3 import MP3
+            from mutagen.id3 import ID3, TIT2, TPE1, TALB, TCON, TRCK, APIC, USLT, error
+        except ImportError:
+            print("⚠️ 未安装 mutagen，跳过 MP3 标签内嵌（pip install mutagen 后重试）")
+            return False
+        try:
+            mp3_path = str(mp3_path)
+            audio = MP3(mp3_path, ID3=ID3)
+            try:
+                audio.add_tags()
+            except error:
+                pass
+            tags = audio.tags
+
+            def set_frame(frame, val):
+                if val:
+                    tags.delall(frame.__name__)
+                    tags.add(frame(encoding=3, text=val))
+
+            set_frame(TIT2, metadata.get("title", ""))
+            set_frame(TPE1, metadata.get("artist", ""))
+            set_frame(TALB, metadata.get("album", ""))
+            set_frame(TCON, metadata.get("genre", ""))
+            trck = metadata.get("track", "")
+            tt = metadata.get("totaltracks", "")
+            if trck:
+                set_frame(TRCK, f"{trck}/{tt}" if tt else trck)
+
+            cover = self._normalize_cover_jpeg(metadata.get("cover_data"))
+            if cover:
+                # 归一化后保证为 JPEG（山灵等播放器只认 JPEG 封面）
+                tags.delall("APIC")
+                tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover))
+
+            if metadata.get("lyrics"):
+                cleaned = self._clean_lyrics_for_tag(metadata["lyrics"])
+                if cleaned:
+                    tags.delall("USLT")
+                    tags.add(USLT(encoding=3, lang="eng", desc="", text=cleaned))
+
+            audio.save(v2_version=3)
+            print(f"✅ 元数据已内嵌(MP3): {mp3_path}" + ("（含封面）" if cover else ""))
+            return True
+        except Exception as e:
+            print(f"❌ MP3 元数据内嵌异常: {mp3_path}")
             print(f"错误: {e}")
             return False
 
@@ -790,15 +872,17 @@ class FLACMetadataEmbedder:
             else:
                 playlist = []
 
-            # 处理FLAC文件
-            for flac_file in folder.glob("*.flac"):
+            # 处理 FLAC 与 MP3 文件（MP3 多为降级拿到的有损格式，同样内嵌封面/标签）
+            audio_files = list(folder.glob("*.flac")) + list(folder.glob("*.mp3"))
+            audio_files.sort()
+            for audio_file in audio_files:
                 total_files += 1
 
                 # 从文件名解析歌手和歌名
-                artist, title = self.get_metadata_from_filename(flac_file.name)
+                artist, title = self.get_metadata_from_filename(audio_file.name)
 
                 if not artist or not title:
-                    print(f"⚠️ 无法解析文件名: {flac_file.name}")
+                    print(f"⚠️ 无法解析文件名: {audio_file.name}")
                     failed_files += 1
                     continue
 
@@ -808,11 +892,15 @@ class FLACMetadataEmbedder:
                 # 一次搜索供专辑名 / 封面 / 歌词共用
                 gd_meta = self.resolve_gd_track(title, artist)
 
-                metadata = self._build_metadata(flac_file, folder, playlist, genre,
+                metadata = self._build_metadata(audio_file, folder, playlist, genre,
                                                 album_info, title, artist, gd_meta=gd_meta)
 
-                # 内嵌元数据
-                if self.embed_metadata(flac_file, metadata):
+                # 内嵌元数据（FLAC 用 metaflac，MP3 用 mutagen）
+                if audio_file.suffix.lower() == ".mp3":
+                    ok = self.embed_metadata_mp3(audio_file, metadata)
+                else:
+                    ok = self.embed_metadata(audio_file, metadata)
+                if ok:
                     processed_files += 1
                 else:
                     failed_files += 1
@@ -884,7 +972,10 @@ def main():
         )
         metadata['totaltracks'] = '1'
 
-        embedder.embed_metadata(flac_path, metadata)
+        if flac_path.suffix.lower() == ".mp3":
+            embedder.embed_metadata_mp3(flac_path, metadata)
+        else:
+            embedder.embed_metadata(flac_path, metadata)
     else:
         # 处理所有文件
         embedder.process_all_files()
