@@ -376,9 +376,9 @@ metaflac --list --block-type=VORBIS_COMMENT "歌曲.flac"
 metaflac --show-tag=TITLE --show-tag=ARTIST --show-tag=ALBUM --show-tag=GENRE "歌曲.flac"
 ```
 
-## 🚀 使用方法
+## 🚀 使用方法（⚠️ 以下为 2026-08 的历史内容，已过时——请看上方《网络拓扑》《签名算法》）
 
-### 原版网站（推荐）
+### 原版网站（已过时：直连已被 Cloudflare 拦截）
 ```bash
 # 使用现有的原版下载器
 cd "/Users/tommydu/Documents/automatic downloading music"
@@ -432,10 +432,12 @@ python flac_metadata_embedder.py
 
 | 域名 | 状态 | API 端点 | 备注 |
 |------|------|----------|------|
-| music.gdstudio.org | ✅ 完全支持 | `/api.php` | 使用 CRC32 签名，已验证稳定 |
-| music-api.gdstudio.xyz | ✅ 完全支持 | `/api.php` | 基于洛雪音乐源项目逆向成功 |
+| music.gdstudio.org | ❌ 已被 Cloudflare 拦截 | `/api.php` | 直连 403，需 `gd-browser-downloader.js --site org` |
+| music.gdstudio.xyz | ✅ 可用 | `/api.php` | 需浏览器内核；签名见上方《签名算法》 |
+| music-api.gdstudio.xyz | ❌ 已废弃 | `/api.php` | 全站被拦，且不支持 tencent/qobuz |
 
-**最新进展**：国际版 API 已成功逆向工程，支持网易云音乐、酷我音乐等多个平台。
+**最新进展（2026-09-19）**：GD音乐台已全面置于 Cloudflare 之后，直连路线作废；改用浏览器内核（CDP）下载器，
+并默认「全源扫描 → 按实际码率择优」；音频 CDN 仍由 Node 直连。
 
 ## 技术实现
 
@@ -445,8 +447,13 @@ python flac_metadata_embedder.py
 - **支持平台**：网易云音乐、酷我音乐
 - **音质支持**：128k、192k、320k、FLAC
 
-### 签名计算方法
+### 签名计算方法（⚠️ 以下为 2025 旧版推测，**已被推翻**）
+
+> 实测（2026-09-19）：站点 `crc32()` **不是**纯 CRC32，而是「改造过的 MD5 + 隐藏密钥」，
+> 完整算法与证据见上方《签名算法》。**不要按下面的代码去复刻。**
+
 ```javascript
+// 【已作废】旧版以为是标准 CRC32，实际不成立
 function crc32(input) {
     const polynomial = 0xEDB88320;
     let crc = 0xFFFFFFFF;
@@ -460,10 +467,6 @@ function crc32(input) {
     }
     return (crc ^ 0xFFFFFFFF) >>> 0;
 }
-
-// 使用方法
-const signInput = encodeURIComponent(query);
-const signature = crc32(signInput).toString(16).toUpperCase().padStart(8, '0');
 ```
 
 ### API 调用示例
@@ -536,9 +539,9 @@ curl -X POST "https://music-api.gdstudio.xyz/api.php" \
 例如：The Midnight - Sunset [netease-FLAC].flac
 ```
 
-## 🚀 使用方法
+## 🚀 使用方法（⚠️ 以下为 2026-08 的历史内容，已过时——请看上方《网络拓扑》《签名算法》）
 
-### 原版网站（推荐）
+### 原版网站（已过时：直连已被 Cloudflare 拦截）
 ```bash
 # 使用现有的原版下载器
 cd "/Users/tommydu/Documents/automatic downloading music"
