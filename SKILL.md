@@ -83,7 +83,96 @@ node gd-flac-downloader.js --playlist "https://music.163.com/playlist?id=xxx" --
 
 ## 步骤 2：批量下载
 
-使用 `gd-flac-downloader.js`（Node，无第三方依赖），用法：
+### ✅ 首选：`gd-browser-downloader.js`（国际版/国内版双站通用，2026-09 起）
+
+**为什么必须换**：2026-09 实测，GD 音乐台的 `/time` 与 `/api.php` 已全部置于 Cloudflare 机器人防护之后，
+Node / curl 直连**一律 403 `Just a moment...`**——`music.gdstudio.org`、`music.gdstudio.xyz`、
+`music-api.gdstudio.xyz` 三个域名都一样；但静态 `/js/player.js` 仍返回 200，**很容易误判成「站点还能用」**。
+唯一稳定过法是**真实浏览器**跑完 JS 挑战拿到 `cf_clearance`。
+
+新下载器的三段式设计：
+1. 幂等拉起一个带 `--remote-debugging-port` 的 Chrome（独立 profile `~/.gd-chrome-profile`，校验 cookie 可跨次复用）
+2. 通过 CDP（Node 22 内置 WebSocket，**零第三方依赖**）导航到站点并等挑战通过
+3. **所有 `/api.php` 调用都在页面上下文里用站点自带的 `crc32()` 签名**；
+   音频文件在 CDN 上、不受 Cloudflare 保护，仍由 Node 直连流式下载（更快、可校验魔数）
+
+```bash
+# 国际版（满血：netease kuwo joox qobuz tidal apple ytmusic tencent）
+node gd-browser-downloader.js --site xyz --list songs.json --out "downloads/01-xxx" --br 999 --delay 4
+node gd-browser-downloader.js "Resonance - HOME" --site xyz
+# 国内版（直连，音源被下架过一部分）
+node gd-browser-downloader.js --site org --list songs.json --out "downloads/01-xxx"
+# 歌单链接直导 / 限数量 / 只要无损
+node gd-browser-downloader.js --playlist "https://music.163.com/playlist?id=xxx" --max 10 --lossless-only
+```
+
+CLI 与旧脚本保持一致（`--list` `--playlist` `--sources` `--br` `--br-min` `--strict-br` `--lossless-only`
+`--out` `--delay` `--max` `--force`），输出仍是 `歌手 - 歌名.扩展名` + `<out>/.downloaded.json` 索引，
+可直接接 `flac_metadata_embedder.py`。新增：`--site xyz|org`、`--select quality|first`、`--chrome-port`、
+`--chrome-profile`、`--chrome <路径>`、`--proxy <url>`、`--show-window`（默认窗口在屏幕外）、
+`--keep-chrome`（跑完保留浏览器，下次启动更快；默认跑完自动关掉自己拉起的那个）、
+`--attach`（只复用已开的调试端口，不新拉起）。
+
+要求：**Node ≥ 22**（提供内置 WebSocket）+ 本机有 Chrome/Chromium。首次运行会弹出一个独立 Chrome 窗口，属正常。
+
+#### 选源机制：全源扫描 → 择优（默认 `--select quality`）
+
+**不要相信接口返回的 `br`**。站点会把各源归一化标注，实测虚标严重——同一首《Resonance》：
+netease 报 `636`、joox 报 `999`，但按 `size/duration` 反推的**实际码率都只有 ~630kbps**；
+qobuz 报 `999`、实际 `1411kbps`（24bit/48kHz 真 Hi-Res）。所以真正的品质信号是**实际码率**。
+
+流程（`scanSources()` → `candidateScore()`）：
+1. **扫描**：按 `--sources` 把每个源都搜一遍 + 取流一遍，合格的全进候选池（**不提前挑**）
+2. **打分**：`无损 +4e6`、`源声明 has_hires +1e6`、`实际码率×10`（主信号）、
+   `来源微调 ×100`（qobuz/tidal > apple/netease/tencent > joox/kuwo）、`匹配分微调`；
+   有损且 <192kbps 额外扣 2e5
+3. **择优 + 兜底**：打印排序表 → 选第一名下载，失败自动回落次优
+
+```
+[i] 全源扫描：4 个可用候选，按实际品质排序 ——
+     1) qobuz    FLAC 标称999k 实际≈1411k 35.6MB has_hires✓  匹配130 → 采用
+     2) netease  FLAC 标称636k 实际≈639k 16.1MB 已降级  匹配130   备选
+     3) joox     FLAC 标称999k 实际≈630k 15.9MB  匹配130   备选
+     4) apple    M4A 标称256k 实际≈283k 7.1MB 已降级  匹配130   备选
+[✓] 选定音源：qobuz（FLAC 标称999k 实际≈1411k 35.6MB has_hires✓）
+[+] 完成 (qobuz FLAC, xyz): /tmp/gdscan/HOME - Resonance.flac (36MB)  实际: 48.0kHz 24bit 2ch 1404kbps
+```
+
+同曲 A/B 实测（`--select quality` vs `--select first`）：
+
+| 策略 | 选定源 | 体积 | 实测参数 |
+|---|---|---|---|
+| `quality`（默认） | qobuz | 36MB | 48.0kHz **24bit** 1404kbps |
+| `first`（旧行为） | netease | 16MB | 44.1kHz 16bit 636kbps |
+
+下载完成后会用 macOS 自带 `afinfo` 实测 `采样率/位深/声道/码率` 打在日志里（零依赖），
+避免「文件下下来了但不知道是不是真无损」。想省配额就 `--select first`（命中首个无损即停，会漏掉更高品质的源）。
+
+### 🥇 备选（更省事、音质更高）：`chksz-downloader.js`
+
+GD音乐台被 Cloudflare 拦着，只能靠浏览器绕；**ChKSz API** 是普通 HTTPS 接口、**没有 WAF**，
+只要一个免费 apikey 就能直连，档位还更高（网易云 `jymaster` 超清母带 / QQ·酷狗 `master`）。
+
+> ⚠️ **2026-09-19 实测：ChKSz 已暂停邮箱注册**（页面全局 `emailRegistrationEnabled=false`，
+> 点注册直接提示「当前已暂停邮箱注册」），**只剩 LinuxDo OAuth 一条路**：先注册 linux.do 论坛账号 →
+> 用 OAuth 登录 api.chksz.com → 账户页「查看密钥」。key 是服务端签发+服务端校验的，
+> 客户端逆向拿不到（前端只有输入框，CPlayer / 官方 lx 脚本也都是让你自己填 key），不要在这上面浪费时间。
+> 没有 key 时继续用上面的 GD音乐台方案即可（同样免费且能到 24bit 真无损）。
+
+```bash
+export CHKSZ_KEY=你的密钥
+node chksz-downloader.js --list songs.json --out "downloads/01-xxx" --level jymaster --lyrics
+node chksz-downloader.js "晴天 - 周杰伦" --level hires --out "downloads/01-xxx"
+```
+
+参数：`--key`（或环境变量 `CHKSZ_KEY`）、`--level jymaster|hires|lossless|exhigh|standard`（默认 jymaster，
+拿不到逐档降）、`--strict-level`、`--lossless-only`、`--lyrics`、`--api-base`（可指自建/镜像）、
+以及通用的 `--list/--playlist/--out/--delay/--max/--force`。输出约定与上面完全一致，可接同一个
+元数据内嵌流程。音源调研全文见 `音源调研-2026-09.md`。
+
+### （旧）`gd-flac-downloader.js` —— 直连模式，现已被 Cloudflare 拦截
+
+保留作参考与备用（若将来站点撤掉防护仍可直接用）。用法：
 
 ```bash
 node gd-flac-downloader.js --list <playlist.json> --out <歌曲文件夹> \
@@ -109,7 +198,7 @@ node gd-flac-downloader.js --list <playlist.json> --out <歌曲文件夹> \
 
 驱动脚本 `run_all.sh` 顺序遍历 `downloads/0*/playlist.json` 逐个文件夹下载，日志写 `/tmp/gdmusic_batch.log`。
 
-### 国际版批量下载（gd-international-downloader.js）
+### （旧）国际版批量下载（gd-international-downloader.js）—— 同样已被 Cloudflare 拦截
 按关键词搜索下载（网易云 / 酷我），自动跳过已存在文件；**同样内置音质降级链**（按音源支持档位从目标档向下）：
 
 ```bash
@@ -133,18 +222,51 @@ node gd-international-downloader.js "周杰伦" netease 999 5 cn     # 手动指
 4. `downloadOne` 开头先查 `.downloaded.json` 索引与同名音频文件，已存在则跳过，不发 API 请求
 5. 触发限流后：kill 进程 → 等冷却 → 以更大 delay 续跑（已存在文件自动跳过 = 断点续传）
 
-### 网络拓扑
-- **主站**: `https://music.gdstudio.org` ✅ 完全支持（`gd-flac-downloader.js`）
-- **国际版**: `https://music-api.gdstudio.xyz` ✅ 完全支持（`gd-international-downloader.js`，含 cn/hk/us 镜像）
+### 网络拓扑（2026-09 复测）
+| 站点 | 域名 | 状态 |
+|---|---|---|
+| 国际版（满血） | `music.gdstudio.xyz` | ✅ `gd-browser-downloader.js --site xyz` |
+| 国内版（直连，音源被下架过一部分） | `music.gdstudio.org` | ✅ `gd-browser-downloader.js --site org` |
+| 旧 API 子域 | `music-api.gdstudio.xyz` | ❌ 已被 Cloudflare 全站拦截，且不支持 tencent/qobuz |
 
-主站签名：`/time` 拿时间戳 → VM 跑 `crc32.min.js` 对 `encodeURIComponent(name)` 求 crc32 → 拼 `s=` 参数
-POST `/api.php`，`Content-Type: application/x-www-form-urlencoded`，需 UA / X-Requested-With 头
-API 返回 `{songname, artist, album, url, br, size, source, lrc}`；`url` 为需二次请求的真实下载地址
-下载音质优先级按 `br` 排序（999=FLAC，越高越好）；**默认**无无损时也会接受有损里最高品质那份
-（要严格只收无损请加 `--lossless-only`）
+- **音频 CDN 不受 Cloudflare 保护**：`types=url` 拿到的 `url`（`m701.music.126.net` / `akamaized.net` / `tidal` 等）
+  用 Node 直连即可，实测带 `Referer: https://<host>/` + 浏览器 UA 就返回 200 + 正确魔数（`fLaC`）。
+- 音源支持差异（实测查询 `晴天 周杰伦`）：xyz 支持 netease / **kuwo** / **joox** / **qobuz** / **tidal** / apple / ytmusic / tencent；
+  `migu` `kugou` `spotify` `ximalaya` 一律返回 `Value of source is not supported.`
+- ⚠️ **繁简必须归一**：joox 返回的是繁体「周杰倫」，不做 `t2s` 转换会被判成「歌手不符」而整首跳过。
+  `gd-browser-downloader.js` 会从站点拉 `/js/chinese-s2t.js` 缓存到 `.gd-flac-cache/` 并用于匹配。
 
-国际版签名：`s = crc32Hex(encodeURIComponent(name 或 id))`，POST form 到 `<mirror>/api.php`；
-限流口径约 50 次/5 分钟，遇 401 自动指数退避重试。
+### 签名算法（2026-09 逆向，重要）
+```
+s = md5( ts9 + "|" + location.hostname + "|" + version每段补零2位 + "|" + encodeURIComponent(入参) ).slice(-8).toUpperCase()
+```
+- `ts9` = `GET /time` 返回的 10 位秒级时间戳取**前 9 位**（10 秒粒度）；`version` 取自 `js/player.js` 的
+  `mkPlayer.version`（当前 `2026.09.16` → 补零后 `20260916`）
+- 调用点形如 `s=" + crc32(urlEncode(String(id)))`（见 `js/ajax.js`），入参是 **urlEncode 之后**的串
+- ⚠️ **函数名叫 crc32，实际是 MD5，而且是被改过的 MD5**：文件里是 HMAC-MD5 结构（双垫常量
+  `0x36363636` / `0x5c5c5c5c`），实测站点全局 `md5("abc") = 9ef90af686e68195b6f6d89b69d3c584`
+  ≠ 标准 `900150983cd24fb0d6963f7d28e17f72`；用 183 个常见密钥爆破 HMAC-MD5 / `md5(key+msg)` /
+  `md5(msg+key)` 全部未命中（密钥藏在 jsjiami v7 混淆字符串表里）
+- **结论：不要在 Node 里复刻签名**，直接调页面里的 `crc32()`——顺带免疫站点后续改算法。
+  `gd-browser-downloader.js` 的 `ensureSigner()` 会轮询等它就绪
+
+### 浏览器窗口怎么处理（2026-09-19 实测，三条都验过）
+
+| 方案 | 结果 |
+|---|---|
+| 真无头 `--headless=new` | ❌ **被 Cloudflare 识破**，永远卡在 `Just a moment...`，`crc32` 始终 undefined |
+| 抠出浏览器 `cf_clearance` 给 Node/curl 用 | ❌ **仍然 403**（cf_clearance 绑 IP + TLS 指纹，undici/curl 指纹与 Chrome 差太远） |
+| **有头 Chrome + `--window-position=-4000,-4000`（移出屏幕）** | ✅ 正常过校验，用户看不到窗口 —— **默认就用这个** |
+
+所以 `gd-browser-downloader.js` 现在：
+- 默认把窗口挪到屏幕外（`--show-window` 可改回可见，便于手动干预）
+- 启动后做**存活校验**（端口起来 ≠ 能活，容器/沙箱里 Chrome 自带沙箱会失败导致 GPU 崩溃退出），
+  崩了就自动换 `--no-sandbox --disable-gpu …` 重试，并把可用模式记到 `.gd-flac-cache/chrome-mode.json`，
+  下次直接走对的模式（实测第二次启动从 34s 降到 27s）
+- 跑完**自动关闭自己拉起的 Chrome**（`--keep-chrome` 可保留）；用户自己开的浏览器不受影响
+- 万一离屏窗口过不了校验，会自动改成显示窗口重试一次
+
+
 
 ### ⚠️ 假限流：查询串含 `(` `)` `'` 时搜索必失败（实测 2026-08-29）
 
@@ -482,8 +604,10 @@ python flac_metadata_embedder.py
 
 | 文件 | 作用 |
 |------|------|
-| `gd-flac-downloader.js` | 批量下载器（Node，零依赖，内置签名+防限流+断点续传） |
-| `gd-international-downloader.js` | 国际版下载器（支持网易云音乐、酷我音乐） |
+| `gd-browser-downloader.js` | **首选下载器**：浏览器内核（CDP）双站通用，过 Cloudflare，Node ≥ 22 零依赖 |
+| `chksz-downloader.js` | **备选下载器**：ChKSz API 直连（无 WAF），免费 apikey 可到超清母带 |
+| `gd-flac-downloader.js` | （旧）直连批量下载器，现被 Cloudflare 拦截，保留作参考 |
+| `gd-international-downloader.js` | （旧）国际版直连下载器，同上 |
 | `run_all.sh` | 顺序跑所有风格文件夹的下载驱动 |
 | `flac_metadata_embedder.py` | 元数据+歌词+封面内嵌（Python + metaflac，**仅 FLAC**） |
 | `download_lyrics.py` | 给**非 FLAC**（mp3/m4a/aac/ogg/wav/wma）单独补 `.lrc`，只写文件不改音频 |

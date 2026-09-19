@@ -73,3 +73,35 @@
 - gd-international-downloader.js：新增 cn/hk/us 镜像分流（按音源自动选，可第 5 参数手动指定）。
 - SKILL.md / README.md：文档同步更新。
 - 说明：本次会话 bash 工具不可用（posix_spawn 失败），未能运行 python 语法检查与真实 API 联测，建议先 `python3 -m py_compile flac_metadata_embedder.py` 再用 `--single-file` 试跑一首验证封面/翻译。
+
+## 5. 逆向 GD音乐台前端的**可复用方法**（2026-09-19 实践）
+
+站点前端 `js/crc32.min.js` 是 jsjiami.com.v7 混淆，但有两个「后门」能让我们不必硬啃混淆：
+
+### 技巧 A：把混淆文件丢进 Node 的 vm 里跑，签名函数照样能用
+给它一个 `window.location.hostname` / `FakeXHR(返回 /time)` / `mkPlayer.version` 的 shim 即可，
+`ctx.crc32()` 就能算签名。这样签名逻辑永远不用自己实现。
+
+### 技巧 B：混淆字符串解码器是全局函数，可以拿来解密整张字符串表
+文件里 `function _0x2783(idx, key)` 定义在顶层 → 跑完就挂在全局。于是：
+1. 正则抠出所有调用点 `(0x1c8,'0Bf6')` 形式的 `(idx, key)` 对；
+2. 逐个 `_0x2783(idx, key)` 调用，就能还原 285 条明文（本项目实测 466 个调用点 → 285 条去重）。
+
+### 技巧 C（最有用）：把全局函数包一层，直接看它被谁调用、参数是什么
+```
+globalThis.md5 = function(){ __calls.push([...arguments]); return orig.apply(this,arguments); }
+```
+用它一次就把签名链路钉死了：
+```
+crc32("Resonance")  →  md5("178978936|music.gdstudio.xyz|20260916|Resonance")  →  slice(-8).toUpperCase()
+```
+比读混淆代码快得多，且是「运行时事实」而非推测。
+
+### 结论与边界
+- 拼接式 `ts9|hostname|version每段补零2位|入参` **确认无误**；`ts9` = `/time` 的 10 位秒级时间戳取前 9 位；
+  `version` 取 `js/player.js` 的 `mkPlayer.version`（当前 `2026.09.16` → `20260916`）。
+- 但 `md5` **内核被改造**（`md5("abc")` ≠ 标准 MD5），字符串表里也没有可用的 HMAC 密钥 →
+  **离线复刻到此为止，不要浪费时间**；直接调页面 `crc32()` 即可。
+- 真正必须用浏览器的原因是 **Cloudflare**：cf_clearance 绑定 IP+TLS 指纹，抠出来给 curl/Node 仍 403；
+  `--headless=new` 被识破；**有头 + 窗口移出屏幕**才能过。详见 SKILL.md。
+
