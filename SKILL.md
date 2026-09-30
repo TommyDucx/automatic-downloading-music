@@ -5,7 +5,8 @@ description: >-
   批量下载高品质FLAC音乐（GD音乐台多音源），自动按音乐风格分文件夹管理，
   下载时顺带抓取站点「歌曲详情」（专辑/封面/歌词+翻译）存入本地索引，内嵌时零 API 直接复用，
   为每首歌内嵌完整元数据（歌名、歌手、专辑、风格、年份、歌词、封面）的完整工作流。
-  内置 Embeat 歌曲推荐（GD音乐台 AI：按自然语言描述或种子歌推荐相似曲目，可一键转下载）。
+  内置 Embeat 推荐客户端（网页版直连：按自然语言描述或种子歌推荐相似曲目，可一键转下载；
+  embeat-recommend.js 纯 Node 现算站点签名，无需浏览器、无需本地数据库）。
   当用户要求「下载歌曲」「批量下载音乐」「整理音乐库」「内嵌元数据」「给歌曲加歌词/信息」
   「推荐歌曲」「类似XX的歌」「帮我想点听的音乐」时使用。
 
@@ -139,6 +140,9 @@ CN 音源（netease/tencent/joox/kuwo）的搜索匹配**强依赖曲名与艺�
 Node / curl 直连**一律 403 `Just a moment...`**——`music.gdstudio.org`、`music.gdstudio.xyz`、
 `music-api.gdstudio.xyz` 三个域名都一样；但静态 `/js/player.js` 仍返回 200，**很容易误判成「站点还能用」**。
 唯一稳定过法是**真实浏览器**跑完 JS 挑战拿到 `cf_clearance`。
+> 2026-09-30 补充：主站对 curl 的浏览器指纹已放行（带有效签名直连 200，401=仅签名问题），
+> 纯 Node 签名器已落地在 `embeat-recommend.js`（推荐场景不再需要浏览器）；
+> **下载链路仍以浏览器内核为准**（Cloudflare 放行策略会反复，浏览器是最稳的兜底）。
 
 新下载器的三段式设计：
 1. 幂等拉起一个带 `--remote-debugging-port` 的 Chrome（独立 profile `~/.gd-chrome-profile`，校验 cookie 可跨次复用）
@@ -329,17 +333,25 @@ node "$SKILL_DIR/scripts/gd-international-downloader.js" "周杰伦" netease 999
 4. `downloadOne` 开头先查 `.downloaded.json` 索引与同名音频文件，已存在则跳过，不发 API 请求
 5. 触发限流后：kill 进程 → 等冷却 → 以更大 delay 续跑（已存在文件自动跳过 = 断点续传）
 
-### 网络拓扑（2026-09 复测）
-| 站点 | 域名 | 状态 |
+### 网络拓扑与渠道/音源清单（2026-09-30 全量核查）
+
+**渠道（前端 `apis` 对象）**：
+
+| 渠道 | 地址 | 状态（2026-09-30 实测） |
 |---|---|---|
-| 国际版（满血） | `music.gdstudio.xyz` | ✅ `gd-browser-downloader.js --site xyz` |
-| 国内版（直连，音源被下架过一部分） | `music.gdstudio.org` | ✅ `gd-browser-downloader.js --site org` |
-| 旧 API 子域 | `music-api.gdstudio.xyz` | ❌ 已被 Cloudflare 全站拦截，且不支持 tencent/qobuz |
+| 站点自身（lo） | `https://music.gdstudio.xyz/api.php` / `music.gdstudio.org/api.php` | ✅ **全音源**转发（前端所有请求都走这里）；需签名；**curl 直连已可行**（不再被 CF 拦，401=签名不对）；下载仍首选 `gd-browser-downloader.js`（无头浏览器 + 自动签名，最稳） |
+| 官方 API 镜像 | `https://music-api.gdstudio.xyz/api.php` | ✅ **免签名直连**；但只支持 **netease / joox**（bilibili 返回空数组；tencent/kuwo/kugou/migu/qobuz/tidal/spotify/apple/ytmusic/deezer/ximalaya 报 `Value of source is not supported.`）；`search / url / pic / lyric` 全部可用 |
+| 旧官方镜像 | `music-api-cn/-hk/-us.gdstudio.xyz` | ❌ 已下线（DNS 不解析） |
+| 播放代理 | `https://music-proxy.gdstudio.org` | 站点播放 bilibili/tidal 时用的前端 `proxyUrl`，一般用不到 |
+
+**音源清单（站点全量 15 个，来自前端 `copyrightBox` 映射 + `album_sources`）**：
+`netease` `tencent` `kuwo` `kugou` `migu` `joox` `qobuz` `tidal` `spotify` `apple` `ytmusic` `deezer` `ximalaya` `bilibili` `embeat`(推荐源)
+- 前端默认屏蔽 `bansources:["tencent","kuwo","joox"]`（设置里可开）
+- `cache_sources`（需服务端中转解密、播放较慢）：`ytmusic / deezer / spotify / apple`
+- 前端 API `types` 全集：`search / search_album / search_playlist / url / pic / lyric / autosource / embeat_agent / embeat_by_track / playlist / userlist`
 
 - **音频 CDN 不受 Cloudflare 保护**：`types=url` 拿到的 `url`（`m701.music.126.net` / `akamaized.net` / `tidal` 等）
   用 Node 直连即可，实测带 `Referer: https://<host>/` + 浏览器 UA 就返回 200 + 正确魔数（`fLaC`）。
-- 音源支持差异（实测查询 `晴天 周杰伦`）：xyz 支持 netease / **kuwo** / **joox** / **qobuz** / **tidal** / apple / ytmusic / tencent；
-  `migu` `kugou` `spotify` `ximalaya` 一律返回 `Value of source is not supported.`
 - ⚠️ **繁简必须归一**：joox 返回的是繁体「周杰倫」，不做 `t2s` 转换会被判成「歌手不符」而整首跳过。
   `gd-browser-downloader.js` 会从站点拉 `/js/chinese-s2t.js` 缓存到 `.gd-flac-cache/` 并用于匹配。
 
@@ -422,70 +434,87 @@ s = md5( ts9 + "|" + location.hostname + "|" + version每段补零2位 + "|" + e
 `Part 2` / `Part 3` 都指向同一首 `Luv(Sic)`，下到两个 30MB 的**完全相同**文件），
 下完务必 `shasum` 查重再入库。
 
-## 扩展：Embeat 歌曲推荐（按描述 / 按种子歌，2026-09-25 接入）
+## 扩展：Embeat 歌曲推荐（网页版直连，2026-09-30 打通；无需浏览器、无需本地数据库）
 
 **Embeat 是 GD音乐台自家的推荐系统**（开源：https://github.com/gdstudio-org/Embeat）：
 EmbeatMLP 声学向量（"听起来像"）+ Track2Vec 歌单协同过滤（"大众口味"）+ 6291 个微流派标签，
-多路召回融合，6291 micro-genre 覆盖 200 万歌手，冷门歌表现极稳。**线上 API 免部署直接可用**，
+多路召回融合，覆盖 200 万+ 歌手，冷门歌表现极稳。**线上接口免部署直接可用**，
 返回标准曲目列表（结构与 search 相同），可直接接 `--list` 下载。
 
 ### 推荐决策树（拿到用户需求后怎么用）
 
 | 用户诉求 | 用法 |
 |---|---|
-| 「推荐一些**类似 XX** 的歌」 / 「和 XX 听感像的」 | `embeat_by_track`，种子歌 = XX |
-| 纯描述/心情/场景（「深夜学习的轻柔 jazz hiphop」「健身蹦迪」） | `embeat_agent`（站点官方"AI 深度分析"，直接吃自然语言） |
-| 「推荐 XX 歌手风格的新歌」 | 先 search 歌手热门曲 → 用它当 `embeat_by_track` 种子 |
-| 描述里点出了具体歌名 | 优先 `embeat_by_track`（描述匹配不如种子精准） |
+| 「推荐一些**类似 XX** 的歌」 / 「和 XX 听感像的」 | `--like "歌名 - 歌手"`（embeat_by_track，种子歌 = XX） |
+| 纯描述/心情/场景（「深夜学习的轻柔 jazz hiphop」「健身蹦迪」） | `--desc "<描述>"`（embeat_agent，直接吃自然语言） |
+| 「推荐 XX 歌手风格的新歌」 | 先 search 歌手热门曲 → 用它当种子；或直接 `--desc "XX 风格"` |
+| 描述里点出了具体歌名 | 优先 `--like`（种子比描述精准） |
 
-推荐结果 → 挑几首 → 直接拼进 `--list` JSON 用 `gd-browser-downloader.js` 下载，一气呵成。
+### ✅ 怎么调：`embeat-recommend.js`（首选，纯 Node + 系统 curl，零第三方依赖）
 
-### 接口契约（从 `js/ajax.js?v=20260925` 逆向，权威；站点改版后需复核）
+```bash
+# 按描述推荐（agent）
+node "$SKILL_DIR/scripts/embeat-recommend.js" --desc "深夜学习的轻柔爵士hiphop" --count 15
+# 按种子歌推荐（by_track），并写出下载器能直接吃的歌单
+node "$SKILL_DIR/scripts/embeat-recommend.js" --like "晴天 - 周杰伦" --count 15 --out recs.json
+# 也支持 Spotify track id / ISRC 当种子、--site org、--json
+node "$SKILL_DIR/scripts/embeat-recommend.js" --track-id 5pIcwtJYNJx93l420oR2Vm --count 10
+```
+
+拿到 `--out recs.json` 后直接下载（一气呵成）：
+
+```bash
+node "$SKILL_DIR/scripts/gd-browser-downloader.js" --list recs.json --out "<文件夹>"
+```
+
+**原理（为什么不用浏览器、不用本地库）**：
+1) 签名复用站点自己的 `js/crc32.min.js`——丢进 Node `vm`，配 shims
+   （`location.hostname`、`mkPlayer.version`（从 `js/player.js` 动态解析）、FakeXHR 返回 `/time`）
+   即可现算签名（与 GDSTUDIO_REFERENCE.md 技巧 A 相同）；
+2) 拿签名后**用 curl 直连主站 `api.php`**（Node 内置 fetch/undici 的 TLS 指纹会被拦，curl 不会）；
+3) 签名被服务端拒绝（站点升级算法）时脚本自动拉新 `crc32.min.js` 重试。
+
+### 接口契约（从 `js/ajax.js` 逆向，权威；站点改版后需复核）
 
 两个都是**同源 GET**、签名规则与搜索完全一致（`s=crc32(String(urlEncode(主参数)))`）：
 
 ```js
-// ① embeat_agent：自然语言描述推荐（rem.type === 'embeat_agent' 走 ajaxSearch 通用路径）
-//    name = urlEncode(用户的描述原文)
+// ① embeat_agent：自然语言描述推荐（走 ajaxSearch 通用路径）
+//    name = urlEncode(描述原文)；实测 count 不生效（一次回全部候选），客户端自行截断
 GET /api.php?types=embeat_agent&count=20&source=<source>&pages=1&name=<urlEncode(描述)>&s=<crc32(String(urlEncode(描述)))>
 
 // ② embeat_by_track：种子歌推荐（函数 ajaxEmbeat）
-//    name = urlEncode(JSON.stringify({name, artist, id, isrc}))
+//    name = urlEncode(JSON.stringify({name, artist, id, isrc}))；count 生效
 //    - artist 取逗号分隔的第一位；id=Spotify track id（可空）；isrc（可空）；name+artist 必填其一组合
-//    - source 不支持 bilibili；返回同 search 的曲目数组
+//    - source 不支持 bilibili；返回同 search 的曲目数组（source 字段为 "embeat"）
 GET /api.php?types=embeat_by_track&count=20&source=<source>&pages=1&name=<urlEncode(JSON)>&s=<crc32(String(urlEncode(JSON)))>
 ```
 
 ⚠️ 查询串 WAF 黑名单同样适用（`'` `*` `(` `)` 会 401，见《假限流》节）——描述里带括号/撇号先清洗。
 
-### 怎么调（复用下载器的浏览器内核机制）
-
-页面上下文内发起（Cloudflare 后面，必须真浏览器；Node 直连拿不到）：
+### 回退：浏览器内核方式（签名直连失效时）
 
 ```bash
-# 现成测试脚本（启动无头 Chrome → 过盾 → 页面里发签名请求，两个接口各测一次）：
-node "$SKILL_DIR/scripts/embeat_page_test.js"
-# 里面 eval 的两个 fetch 就是模板：把描述/种子替换后即可当推荐调用用
+node "$SKILL_DIR/scripts/embeat_page_test.js"   # 无头 Chrome → 过盾 → 页面里用站点 crc32() 发签名请求
 ```
 
-把 `embeat_page_test.js` 里的 fetch 部分抽出来就是推荐函数；返回 JSON 数组每项含
-`name / artist(数组或字符串) / album / sources / score`，与 `search` 结果同构，可直接喂下载器。
+### 本地自部署 Embeat（可选，仅离线/大批量才值得——2026-09-30 实测部署过，已按需删除）
 
-### ⚠️ CF 时段问题（2026-09-25 全天实测规律）
-
-无头 Chrome 过 Cloudflare 挑战**间歇性失败**：上午/清晨放行率高，午后/晚间常死循环
-（"Just a moment..." 永过不去），换代理出口、换全新 profile 都未必救得回来，**过几小时会自愈**。
-对策：过不了盾就换时段重试，别硬刚；要立刻用就 `--show-window` 或 `--attach` 人工过一次盾复用会话。
-
-### 备选：本地自部署 Embeat（离线/大批量推荐才值得）
+网页版接口够用后**不建议本地部署**：mini 版 3.7GB 压缩 / 9.3GB 解压 / ~2.5GB 内存（1200 万+ 曲目），
+full 版 17.5GB 压缩 / 40GB 解压 / ~20.5GB 内存；且**没有数据库等于零**（模型权重必须配合数据库使用）。
+实测步骤（macOS Intel，无 Docker 也行）：
 
 ```bash
 git clone https://github.com/gdstudio-org/Embeat && cd Embeat
-conda create -n embeat python=3.10 && conda activate embeat
-pip install -r requirements.txt   # 需 Qdrant 服务 + 下载 2GB+ 向量库（2GB RAM 即可跑）
-cd infer
-python Embeat.py -s "晴天 - Jay Chou"   # 也支持 -t <Spotify track id> / -t <ISRC> / -a <歌手>
-python Embeat.py -t '适合深夜的轻柔爵士hiphop'   # GitHub README 未列出 agent 子命令，以 -h 为准
+conda create -n embeat python=3.10 -y
+~/miniconda3/envs/embeat/bin/pip install "qdrant-client>=1.18.0,<1.19.0" "numpy<=1.26.4" gensim python-dotenv zhconv \
+    beautifulsoup4 requests cloudscraper gdown      # 推理不需要 torch
+# Track2Vec 权重（HF: GD-Studio/embeat-track2vec）→ checkpoints/Track2Vec/track2vec.wv(+vectors.npy)
+# Qdrant 必须 1.18.x（README 强调）：github release 的 qdrant-x86_64-apple-darwin.tar.gz 解压即用
+# 数据库：Google Drive 文件夹 1dFdueTmcWgGZXhJXs7c7YOjeniZsSW9x（v2_20260901/，mini/base/full 三档）
+QDRANT__STORAGE__STORAGE_PATH=<解压出的 embeat_qdrant_db 目录> ./qdrant
+cp .env.example infer/.env      # 注意 .env 要放 infer/ 下（代码读 file_dir/.env）
+cd infer && python Embeat.py -s "晴天 - Jay Chou"   # 也支持 -t <track id/ISRC> / -a <歌手>
 ```
 
 ## 步骤 3：内嵌元数据
@@ -652,8 +681,8 @@ python3 "$SKILL_DIR/scripts/flac_metadata_embedder.py"
 | 域名 | 状态 | API 端点 | 备注 |
 |------|------|----------|------|
 | music.gdstudio.org | ✅ 可用（直连） | `/api.php` | 需 `gd-browser-downloader.js --site org --proxy "direct://"`（绕开系统代理）；2026-09-25 起 POST→GET、查询串禁 `' * ( )` |
-| music.gdstudio.xyz | ⚠️ 2026-09-25 起国内**直连 TCP 不通**，必须走代理 | `/api.php` | `--site xyz --proxy http://127.0.0.1:7897 --chrome-profile <全新隔离目录>`；⚠️ 旧「xyz 直连可用」结论作废 |
-| music-api.gdstudio.xyz | ❌ 已废弃 | `/api.php` | 全站被拦，且不支持 tencent/qobuz |
+| music.gdstudio.xyz | ⚠️ 时通时不通；**带有效签名时 curl 可用（2026-09-30 实测 search/embeat 均通）** | `/api.php` | 下载仍首选 `--site xyz`（浏览器内核）；Node 端签名器见 `embeat-recommend.js` |
+| music-api.gdstudio.xyz | ⚠️ 免签名直连可用，但**仅 netease/joox** | `/api.php` | search/url/pic/lyric 都通；tencent/kuwo 等报 `Value of source is not supported.`；cn/hk/us 旧镜像已下线（DNS 不解析） |
 
 **最新进展（2026-09-19）**：GD音乐台已全面置于 Cloudflare 之后，直连路线作废；改用浏览器内核（CDP）下载器，
 并默认「全源扫描 → 按实际码率择优」；音频 CDN 仍由 Node 直连。
@@ -828,7 +857,8 @@ python3 "$SKILL_DIR/scripts/flac_metadata_embedder.py"
 
 | 文件 | 作用 |
 |------|------|
-| `gd-browser-downloader.js` | **首选下载器**：浏览器内核（CDP）双站通用，过 Cloudflare，Node ≥ 22 零依赖 |
+| `gd-browser-downloader.js` | **首选下载器**：浏览器内核（CDP）双站通用，过 Cloudflare，Node ≥ 22 零依赖；下载时顺抓站点详情（`--enrich` 可补旧索引） |
+| `embeat-recommend.js` | **Embeat 推荐客户端（网页版直连）**：Node vm 现算站点签名 + curl 调用，无需浏览器/本地库；支持 `--desc` / `--like` / `--track-id` / `--isrc`，`--out` 写下载器歌单 |
 | `chksz-downloader.js` | **备选下载器**：ChKSz API 直连（无 WAF），免费 apikey 可到超清母带 |
 | `gd-flac-downloader.js` | （旧）直连批量下载器，现被 Cloudflare 拦截，保留作参考 |
 | `gd-international-downloader.js` | （旧）国际版直连下载器，同上 |
