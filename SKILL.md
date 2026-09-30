@@ -89,6 +89,28 @@ def norm(s): return re.sub(r'[\s\-_]+', '', s).lower()
 # 建立 audio 索引后，把 lrc 按 norm(歌手-歌名) 匹配移动即可
 ```
 
+### ⚠️ 山灵（Shanling）播放器歌词机制（2026-09-30 实测确认，standing rule）
+
+- 山灵 DAP **只读与音频同名、同目录的 `.lrc`**（`song.flac` ↔ `song.lrc`），
+  **不读内嵌 LYRICS 标签**（官方手册/Head-Fi/百度知道口径一致）；
+  播放器设置里需打开「歌词显示 / 歌词同步」。编码用 **UTF-8（无 BOM）**，必须有 `[mm:ss.xx]` 时间轴。
+- **每个音频文件必须配"它自己版本"的歌词，不允许同名曲共用**：
+  录音室版 / Live 版 / Remix 版的**歌词时间轴不同**，拿错版本山灵上会整首歌错位。
+  文件名带 `(Live)`/`(Remix)` 就要匹配对应版本；文件名没有标记则**禁止**配 Live/Remix 歌词。
+- **匹配坑（实测）**：QQ/网易搜索会隐藏部分艺人的录音室版（周杰伦、王力宏等），
+  只返回 Live/翻唱 → 容易被错误匹配。对策：
+  1. 候选带 `live/remix/现场` 等标记而查询没有时**重罚**（已在 `gd-browser-downloader.js`
+     的 `matchScore()` 固化为 -80）；文件名带标记时优先同类标记版本；
+  2. 网易云搜不到就用 **tencent（QQ）源**（GD 签名直连，曲库全）；
+  3. 繁简必须先归一（`燕南飛`→`燕南飞`），否则整首搜不到；
+  4. 时长校验兜底：本地时长与候选时长差 >25s 基本是另一个版本。
+- **SD 卡批量体检/修复流程（实战验证）**：
+  1. 审计：每个音频是否缺同名 `.lrc`；FLAC 是否有 JPEG 封面（`metaflac --list --block-type=PICTURE`）；
+  2. 逐首按「歌名+歌手」双源匹配（netease 免签名镜像 + tencent 签名；版本感知 + 繁简归一 + 时长）；
+  3. 写同名 `.lrc`；封面下载后统一转 JPEG ≤1000px 内嵌（`metaflac --remove --block-type=PICTURE` +
+     `--import-picture-from`，注意 metaflac **不能混用 major/shorthand 操作**，需分多次调用）；
+  4. 复检到「除确实无资源的曲目外，每首都有同名歌词 + 封面」。
+
 ## 步骤 1：建目录与歌单
 
 每首歌单 `playlist.json` 为数组，元素 `{"title": "...", "artist": "..."}`，**必须用真实歌手/曲名**，不要带 "(Instrumental)" "(Ambient Reprise)" 等不存在版本后缀，否则搜不到。

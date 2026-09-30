@@ -816,9 +816,13 @@ function matchScore(t, query) {
     else score -= 100;
   } else artistOk = true;
 
-  const bad = /(remix|cover|live|karaoke|伴奏|翻唱|现场版|纯音乐|instrumental|demo|rework|bootleg|dj|beat|montagem)/;
-  if (bad.test(tName)) score -= 25;
-  if (bad.test(tArtist)) score -= 20;
+  // 版本感知（2026-09-30 实测教训）：文件名没有 live/remix 等标记时，带标记的候选要重罚，
+  // 否则会把「录音室版」的文件配上 Live/Remix 版本（歌词时间轴不同，山灵上显示会错位）。
+  // 文件名带标记时（查询里就有）则不加罚，优先匹配同类版本。
+  const bad = /(remix|cover|live|karaoke|伴奏|翻唱|现场|演唱会|纯音乐|instrumental|demo|rework|bootleg|dj|beat|montagem)/i;
+  const badInQuery = bad.test(query.title || "");
+  if (bad.test(tName) && !badInQuery) score -= 80;
+  if (bad.test(tArtist) && !badInQuery) score -= 20;
   if (t.extra_data && t.extra_data.is_available === false) score -= 50;
   return { score, ok: nameOk && artistOk };
 }
