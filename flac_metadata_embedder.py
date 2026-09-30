@@ -3,11 +3,16 @@
 FLAC 文件元数据内嵌工具
 支持：歌词、歌手、专辑、风格、年份、封面图片、翻译歌词等
 
-参考实现（GD音乐台 API 刮削）：
+站点详情优先（2026-09 起）：
+- gd-browser-downloader.js 下载每首歌时会从 music.gdstudio.org/.xyz 抓取站点
+  「歌曲详情」（歌名/歌手/专辑/时长/来源/歌曲ID/封面URL/歌词+翻译）写入同目录
+  .downloaded.json；本脚本优先读取这份本地详情，零 API 请求即可内嵌专辑/封面/歌词。
+- 本地没有（旧下载、chksz 等其他下载器）才回落到在线刮削。
+
+在线刮削参考实现（仅在无本地详情时使用）：
 - github.com/Azincc/gdstudio-embeded-service 的 internal/service/gdstudio/client.go
   （types=search/url/pic/lyric、封面尺寸回退、tlyric 翻译、镜像分流 cn/hk/us、指数退避）
-- 签名沿用本技能 gd-international-downloader.js 实测有效的 crc32 方案：
-  s = crc32Hex(encodeURIComponent(name 或 id))，POST x-www-form-urlencoded 到 <mirror>/api.php
+- 注意：music-api.* mirror 已被 Cloudflare 全站拦截，此路径通常只在本地详情缺失时兜底尝试。
 """
 
 import os
@@ -299,6 +304,8 @@ class FLACMetadataEmbedder:
         self._gd = None
         # (归一化曲名, 归一化歌手) -> pick_metadata 结果，避免同一首歌重复打搜索 API
         self._gd_track_cache = {}
+        # 文件夹 -> .downloaded.json 内容（下载器写入的站点歌曲详情，本地优先数据源）
+        self._local_index_cache = {}
 
     @property
     def gd(self):
@@ -390,6 +397,73 @@ class FLACMetadataEmbedder:
             return " ".join(w[:1].upper() + w[1:] for w in name.split())
         return name
 
+    # ------------------------------------------------------ 本地站点详情（优先）
+    @staticmethod
+    def _safe_key(artist, title):
+        """与下载器 safeBase 一致的索引键：`歌手 - 歌名`，剔除文件系统非法字符"""
+        key = re.sub(r'[\\/*?:"<>|]', " ", f"{artist} - {title}")
+        return re.sub(r"\s+", " ", key).strip()
+
+    def _load_local_index(self, folder):
+        """读取歌曲文件夹内下载器写入的 .downloaded.json（含站点歌曲详情），按文件夹缓存"""
+        folder = Path(folder)
+        key = str(folder)
+        if key not in self._local_index_cache:
+            data = {}
+            p = folder / ".downloaded.json"
+            try:
+                if p.exists():
+                    raw = json.loads(p.read_text(encoding="utf-8"))
+                    if isinstance(raw, dict):
+                        data = raw
+            except Exception as e:
+                print(f"   ⚠️ 读取 .downloaded.json 失败（{p}）: {e}")
+            self._local_index_cache[key] = data
+        return self._local_index_cache[key]
+
+    def resolve_local_meta(self, folder, audio_name, title, artist):
+        """从本地索引取站点歌曲详情（下载时由 gd-browser-downloader.js 抓取并落盘）。
+
+        对应站点「歌曲详情」弹窗的全部字段：歌名/歌手/专辑/时长/来源/歌曲ID/
+        文件大小/播放音质/封面URL/歌词（含翻译）。
+        返回与 pick_metadata 同构的 dict，外加 CoverURL / Lyric / TLyric / Source /
+        Duration 字段；本地没有则返回 None（调用方回落在线 API 刮削）。
+        """
+        if not self.use_gdmusic:
+            return None
+        index = self._load_local_index(folder)
+        if not index:
+            return None
+        entry = index.get(self._safe_key(artist, title))
+        if not isinstance(entry, dict) or entry.get("file") != audio_name:
+            # 索引键与文件名不一致时按 file 字段反查（以实际落盘文件名为准）
+            entry = next((v for v in index.values()
+                          if isinstance(v, dict) and v.get("file") == audio_name), None)
+        if not isinstance(entry, dict):
+            return None
+        t = entry.get("track") or {}
+        lyric = entry.get("lyric") or {}
+        artist_val = t.get("artist")
+        if isinstance(artist_val, list):
+            artist_val = " / ".join(str(a) for a in artist_val if a)
+        meta = {
+            "TrackID": str(t.get("id") or ""),
+            "Title": str(t.get("name") or ""),
+            "Artist": str(artist_val or ""),
+            "Album": str(t.get("album") or ""),
+            "PicID": str(t.get("pic_id") or ""),
+            "LyricID": str(t.get("lyric_id") or ""),
+            "CoverURL": str(entry.get("cover_url") or ""),
+            "Lyric": str(lyric.get("lyric") or ""),
+            "TLyric": str(lyric.get("tlyric") or ""),
+            "Source": str(t.get("source") or entry.get("src") or ""),
+            "Duration": t.get("duration"),
+            "_local": True,
+        }
+        if not (meta["Title"] or meta["CoverURL"] or meta["Lyric"]):
+            return None
+        return meta
+
     def resolve_gd_track(self, title, artist, count=20):
         """搜索并挑出可信条目，结果按 (title, artist) 缓存。
 
@@ -411,7 +485,8 @@ class FLACMetadataEmbedder:
         return meta
 
     def download_gd_lyrics(self, title, artist, save_dir=None, gd_meta=None, audio_path=None):
-        """GD音乐台歌词兜底：搜索 -> 取 lyric_id -> types=lyric（含 tlyric 翻译）
+        """歌词兜底：优先用下载时抓取的站点歌词（.downloaded.json 内），
+        否则搜索 -> 取 lyric_id -> types=lyric（含 tlyric 翻译）。
         返回 (lrc_path, translation)；失败返回 (None, None)
 
         audio_path 给出时 .lrc 与音频同名，与 download_lyrics() / download_lyrics.py
@@ -421,10 +496,17 @@ class FLACMetadataEmbedder:
             return None, None
         try:
             meta = gd_meta if gd_meta is not None else self.resolve_gd_track(title, artist)
-            if not meta or not meta.get("LyricID"):
+            if not meta:
                 return None, None
-            data = self.gd.lyric(meta["LyricID"])
-            lrc = (data.get("lyric") or "").strip()
+            # 本地优先：下载器抓取的站点歌词（零 API 请求，镜像 API 被 Cloudflare 拦死也能用）
+            lrc = (meta.get("Lyric") or "").strip()
+            translation = (meta.get("TLyric") or "").strip() or None
+            if not lrc:
+                if not meta.get("LyricID"):
+                    return None, None
+                data = self.gd.lyric(meta["LyricID"])
+                lrc = (data.get("lyric") or "").strip()
+                translation = (data.get("tlyric") or "").strip() or None
             if not lrc:
                 return None, None
             save_dir = Path(save_dir) if save_dir else self.downloads_dir
@@ -435,28 +517,36 @@ class FLACMetadataEmbedder:
                 path = save_dir / self.safe_filename(f"{artist} - {title}.lrc")
             with open(path, "w", encoding="utf-8") as f:
                 f.write(lrc)
-            translation = (data.get("tlyric") or "").strip()
-            return str(path), (translation or None)
+            return str(path), translation
         except Exception as e:
             print(f"⚠️ GD音乐台歌词获取失败（{title} - {artist}）: {e}")
             return None, None
 
     def resolve_cover(self, title, artist, gd_meta=None):
-        """解析并下载封面：搜索 -> pick pic_id -> types=pic（尺寸回退）-> 下载字节
-        返回封面字节或 None
+        """解析并下载封面：优先用下载时抓取的站点封面直链（CoverURL，CDN 直连），
+        否则搜索 -> pick pic_id -> types=pic（尺寸回退）-> 下载字节。返回封面字节或 None
         """
         if not self.use_gdmusic or not self.embed_cover:
             return None
         try:
             meta = gd_meta if gd_meta is not None else self.resolve_gd_track(title, artist)
-            if not meta or not meta.get("PicID"):
+            if not meta:
+                print(f"⚠️ 未找到封面（{title} - {artist}）")
+                return None
+            url = meta.get("CoverURL")
+            if url:
+                data = self.gd.download_cover(url, source=meta.get("Source") or None)
+                if not data:
+                    print(f"⚠️ 封面下载失败（{title} - {artist}）: {str(url)[:100]}")
+                return data
+            if not meta.get("PicID"):
                 print(f"⚠️ 未找到封面（{title} - {artist}）")
                 return None
             url = self.gd.cover_url(meta["PicID"])
             if not url:
                 print(f"⚠️ 封面 URL 获取失败（{title} - {artist}）")
                 return None
-            data = self.gd.download_cover(url)
+            data = self.gd.download_cover(url, source=meta.get("Source") or None)
             if not data:
                 print(f"⚠️ 封面下载失败（{title} - {artist}）")
                 return None
@@ -808,11 +898,12 @@ class FLACMetadataEmbedder:
         gd_meta 为 resolve_gd_track() 的搜索命中条目；专辑名优先取其中的真实专辑，
         取不到才回落到「歌手 -> 内置专辑表」的硬编码值。
         """
-        # 专辑：刮削结果优先，内置表兜底
+        # 专辑：站点详情/刮削结果优先，内置表兜底
         scraped_album = self._pretty_album((gd_meta or {}).get("Album"))
         album = scraped_album or album_info['album']
         if scraped_album and scraped_album != album_info['album']:
-            print(f"   专辑: 采用刮削结果 {scraped_album!r}（内置表为 {album_info['album']!r}）")
+            src_note = "下载时抓取的站点详情" if (gd_meta or {}).get("_local") else "刮削结果"
+            print(f"   专辑: 采用{src_note} {scraped_album!r}（内置表为 {album_info['album']!r}）")
 
         # 下载歌词（保存到歌曲所在文件夹，.lrc 与音频同名）
         lyrics_path = self.download_lyrics(title, artist, save_dir=folder, audio_path=flac_file)
@@ -889,8 +980,15 @@ class FLACMetadataEmbedder:
                 # 获取专辑信息（内置表兜底用）
                 album_info = self.get_album_info(artist, genre)
 
-                # 一次搜索供专辑名 / 封面 / 歌词共用
-                gd_meta = self.resolve_gd_track(title, artist)
+                # 本地优先：下载时随 .downloaded.json 落盘的站点歌曲详情（专辑/封面/歌词）；
+                # 没有才回落在线刮削（同一搜索供三处复用）
+                local_meta = self.resolve_local_meta(folder, audio_file.name, title, artist)
+                if local_meta:
+                    print(f"   [本地] 使用下载时的站点详情"
+                          f"（专辑: {local_meta.get('Album') or '?'}，"
+                          f"封面: {'有' if local_meta.get('CoverURL') else '无'}，"
+                          f"歌词: {'有' if local_meta.get('Lyric') else '无'}）")
+                gd_meta = local_meta or self.resolve_gd_track(title, artist)
 
                 metadata = self._build_metadata(audio_file, folder, playlist, genre,
                                                 album_info, title, artist, gd_meta=gd_meta)
@@ -923,7 +1021,7 @@ def main():
     parser.add_argument('--gd-source', default='netease',
                        help='GD音乐台刮削音源（netease/kuwo/qobuz/joox/migu/ytmusic 等，默认 netease）')
     parser.add_argument('--no-gdmusic', action='store_true',
-                       help='不使用 GD音乐台 API（跳过封面/翻译歌词/歌词兜底）')
+                       help='不使用 GD音乐台数据（本地 .downloaded.json 详情与在线刮削全部跳过）')
     parser.add_argument('--no-cover', action='store_true',
                        help='不内嵌封面')
 
@@ -965,7 +1063,8 @@ def main():
         # 风格同样按所在目录推导，不再一律写死 Electronic
         genre = embedder.get_genre_from_folder(flac_path.parent.name)
         album_info = embedder.get_album_info(artist, genre)
-        gd_meta = embedder.resolve_gd_track(title, artist)
+        local_meta = embedder.resolve_local_meta(flac_path.parent, flac_path.name, title, artist)
+        gd_meta = local_meta or embedder.resolve_gd_track(title, artist)
 
         metadata = embedder._build_metadata(
             flac_path, flac_path.parent, [], genre, album_info, title, artist, gd_meta=gd_meta

@@ -45,6 +45,9 @@
  *   --show-window           显示浏览器窗口（默认把窗口移到屏幕外，看不见）
  *   --keep-chrome           跑完不关闭 Chrome（默认跑完关掉自己拉起的那个）
  *   --attach                只复用已经开着调试端口的 Chrome，不新拉起
+ *   --enrich                对已下载但缺站点详情的旧索引条目，补抓歌曲详情
+ *                           （歌名/歌手/专辑/时长/来源/封面URL/歌词）写入 .downloaded.json，
+ *                           不重新下载音频；供 flac_metadata_embedder.py 内嵌时直接复用
  *
  * 为什么必须用浏览器（2026-09-19 逆向与实测结论，别再走弯路）：
  *   1) 签名已完全逆向：crc32(x) 内部就是把
@@ -66,7 +69,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
-const { spawn, execFileSync } = require("child_process");
+const { spawn, spawnSync, execFileSync } = require("child_process");
 
 // ---------------------------------------------------------------------------
 // 站点配置
@@ -114,6 +117,7 @@ function parseArgs(argv) {
     keepChrome: false,
     attach: false,
     showWindow: false,
+    enrich: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -140,6 +144,7 @@ function parseArgs(argv) {
       case "--keep-chrome": cfg.keepChrome = true; break;
       case "--attach": cfg.attach = true; break;
       case "--show-window": cfg.showWindow = true; break;
+      case "--enrich": cfg.enrich = true; break;
       case "--help":
       case "-h":
         console.log(fs.readFileSync(__filename, "utf8").split("*/")[0].replace(/^\/\*\*?/, ""));
@@ -249,9 +254,41 @@ async function debugPortUp() {
   } catch { return null; }
 }
 
+/** 复用已有 Chrome 时也把它的窗口强制挪到屏幕外。
+ *  老版本代码在校验失败时会弹出可见窗口，那个 Chrome 会一直留在调试端口上被后续运行复用，
+ *  可见窗口也就一直挂着 —— 这里在复用时把所有页面窗口统一移到 -4000,-4000，保证「永不弹窗」。 */
+async function moveWindowsOffscreen(ver) {
+  if (CFG.showWindow) return;
+  let cdp = null;
+  try {
+    cdp = new CDP(ver.webSocketDebuggerUrl);
+    await cdp.connect();
+    const targets = await httpJson(`http://127.0.0.1:${CFG.chromePort}/json/list`, 4000).catch(() => []);
+    for (const t of (targets || [])) {
+      if (t.type !== "page") continue;
+      try {
+        const { windowId } = await cdp.send("Browser.getWindowForTarget", { targetId: t.id });
+        if (windowId == null) continue;
+        // 最小化/最大化状态下 bounds 修改会被忽略，先恢复 normal 再挪
+        await cdp.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "normal" } }).catch(() => {});
+        await cdp.send("Browser.setWindowBounds", { windowId, bounds: { left: -4000, top: -4000 } });
+      } catch {}
+    }
+    log("[i] 已将复用 Chrome 的窗口移到屏幕外（不弹窗）");
+  } catch (e) {
+    log(`[!] 移动窗口失败（不影响下载）：${e.message}`);
+  } finally {
+    try { cdp && cdp.close(); } catch {}
+  }
+}
+
 async function ensureChrome() {
   const up = await debugPortUp();
-  if (up) { log(`[i] 复用已开启调试端口的 Chrome (${up.Browser})`); return up; }
+  if (up) {
+    log(`[i] 复用已开启调试端口的 Chrome (${up.Browser})`);
+    await moveWindowsOffscreen(up);
+    return up;
+  }
   if (CFG.attach) throw new Error(`未检测到调试端口 ${CFG.chromePort}，且指定了 --attach`);
 
   const bin = findChrome();
@@ -264,13 +301,15 @@ async function ensureChrome() {
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-features=CalculateNativeWinOcclusion",
     `--user-agent=${UA}`,
     "--window-size=1280,900",
   ];
-  // 默认把窗口挪到屏幕外 —— 实测 (2026-09-19)：
-  //   真无头 --headless=new 会被 Cloudflare 识破，永远卡在 "Just a moment..."；
-  //   有头浏览器挪到屏幕外则正常过校验（crc32 可用、/api.php 200），用户也看不到窗口。
-  if (!CFG.showWindow) base.push("--window-position=-4000,-4000");
+  // 默认不弹窗：不再依赖「窗口移出屏幕」（Chrome 会把完全离屏的窗口自动拉回可见区域，
+  // 导致弹窗）。改由 ensureChrome 里的可见性模式处理：真无头 → open -j 隐藏实例，均不可见。
+  if (CFG.showWindow) base.push("--window-position=80,60");
   if (CFG.proxy) base.push(`--proxy-server=${CFG.proxy}`);
 
   // 受限/容器环境（沙箱里 Chrome 自带沙箱起不来 → GPU 进程崩溃 → 几十秒后整个浏览器退出）
@@ -280,11 +319,22 @@ async function ensureChrome() {
   let mode = "normal";
   try { mode = (JSON.parse(fs.readFileSync(modeFile, "utf8")).mode) || "normal"; } catch {}
 
-  const launch = (extra, tag) => {
-    log(`[i] 启动 Chrome${tag}${CFG.showWindow ? "" : "（窗口移到屏幕外）"}…`);
+  const launchHeaded = (extra, tag) => {
+    log(`[i] 启动 Chrome${tag}…`);
     const child = spawn(bin, [...base, ...extra, `https://${SITE.host}/`], { detached: true, stdio: "ignore" });
     child.unref();
     chromeChild = child;
+  };
+
+  // open -n -j -g：新实例 + 隐藏启动。App 处于隐藏状态时窗口根本不上屏，
+  // 不依赖「窗口移出屏幕」（Chrome 会把完全离屏的窗口自动拉回可见区域，导致弹窗）。
+  const launchHidden = (extra, tag) => {
+    const appDir = bin.includes(".app") ? bin.slice(0, bin.indexOf(".app") + 4) : bin;
+    log(`[i] 隐藏启动 Chrome${tag}（open -j，无窗口）…`);
+    const r = spawnSync("open", ["-n", "-j", "-g", "-a", appDir, "--args",
+      ...base, ...extra, `https://${SITE.host}/`], { timeout: 30000, encoding: "utf8" });
+    chromeChild = null;   // open 拿不到 child 句柄，closeOwnChrome 走 pgrep 兜底
+    if (r.status !== 0) log(`[!] open 隐藏启动失败: ${String(r.stderr || r.stdout || "").slice(0, 100)}`);
   };
 
   /** 等调试端口 + 确认浏览器没有几秒后就崩掉 */
@@ -297,28 +347,73 @@ async function ensureChrome() {
     return again ? ver : null;      // 端口在但浏览器已退出 → 视为失败
   };
 
-  const order = mode === "compat" ? [COMPAT, [], []] : [[], COMPAT, COMPAT];
-  const tags = mode === "compat" ? ["（兼容模式）", "", ""] : ["", "（兼容模式 --no-sandbox）", "（兼容模式重试）"];
-  for (let i = 0; i < order.length; i++) {
-    if (chromeChild) { closeOwnChrome(); await sleep(1500); }
-    launch(order[i], tags[i]);
-    const ver = await waitAlive();
-    if (!ver) { log("[!] 浏览器启动后异常退出，换参数重试…"); continue; }
-    const used = order[i].length ? "compat" : "normal";
-    if (used !== mode) {
-      try { fs.mkdirSync(path.dirname(modeFile), { recursive: true }); fs.writeFileSync(modeFile, JSON.stringify({ mode: used })); } catch {}
+  // 可见性模式：用户要求「绝不弹窗」。只允许两种真正不可见的启动方式，
+  // 逐一实测「能否过 Cloudflare」——过不了就换下一种，绝不退回可见窗口。
+  const visModes = CFG.showWindow
+    ? [{ id: "headed", tag: "", launch: launchHeaded, needCheck: false }]
+    : [
+        { id: "headless", tag: "（真无头 --headless=new）", launch: (x, t) => launchHeaded(["--headless=new", ...x], t), needCheck: true },
+        { id: "hidden", tag: "（open -j 隐藏实例）", launch: launchHidden, needCheck: true },
+      ];
+
+  const compatOrder = mode === "compat" ? [COMPAT, []] : [[], COMPAT];
+  for (const vm of visModes) {
+    for (const extra of compatOrder) {
+      closeOwnChrome();
+      await sleep(1500);
+      vm.launch(extra, vm.tag + (extra.length ? "（兼容模式）" : ""));
+      const ver = await waitAlive();
+      if (!ver) { log("[!] 浏览器启动后异常退出，换方式重试…"); continue; }
+      if (vm.needCheck) {
+        const ok = await quickSiteCheck(ver);
+        if (!ok) { log(`[!] ${vm.id} 模式过不了 Cloudflare 挑战，换下一种启动方式…`); closeOwnChrome(); continue; }
+        log(`[i] ${vm.id} 模式已通过站点校验（全程无窗口）`);
+      }
+      const used = extra.length ? "compat" : "normal";
+      if (used !== mode) {
+        try { fs.mkdirSync(path.dirname(modeFile), { recursive: true }); fs.writeFileSync(modeFile, JSON.stringify({ mode: used })); } catch {}
+      }
+      log(`[i] Chrome 就绪: ${ver.Browser}`);
+      return ver;
     }
-    log(`[i] Chrome 就绪: ${ver.Browser}`);
-    return ver;
   }
-  throw new Error("Chrome 调试端口未就绪或启动后立即退出，可手动启动 Chrome 后加 --attach");
+  throw new Error("无头/隐藏模式均未能通过站点校验（按要求绝不弹出可见窗口）。可手动登录后加 --attach 复用。");
+}
+
+/** 快速站点校验：开一个标签到目标站，轮询标签标题，离开 Cloudflare 挑战页即算通过 */
+async function quickSiteCheck(ver) {
+  let cdp = null;
+  try {
+    cdp = new CDP(ver.webSocketDebuggerUrl);
+    await cdp.connect();
+    const { targetId } = await cdp.send("Target.createTarget", { url: `https://${SITE.host}/` });
+    let ok = false;
+    for (let i = 0; i < 30; i++) {
+      await sleep(1500);
+      const targets = await httpJson(`http://127.0.0.1:${CFG.chromePort}/json/list`, 3000).catch(() => []);
+      const t = (targets || []).find((x) => x.id === targetId);
+      const title = t ? t.title : "";
+      if (title && !/just a moment|attention required|正在验证/i.test(title)) { ok = true; break; }
+    }
+    await cdp.send("Target.closeTarget", { targetId }).catch(() => {});
+    return ok;
+  } catch { return false; }
+  finally { try { cdp && cdp.close(); } catch {} }
 }
 
 /** 关掉本脚本自己拉起的 Chrome（不动用户自己的窗口） */
 function closeOwnChrome() {
-  if (!chromeChild) return;
-  try { chromeChild.kill("SIGTERM"); } catch {}
-  chromeChild = null;
+  if (chromeChild) {
+    try { chromeChild.kill("SIGTERM"); } catch {}
+    chromeChild = null;
+    return;
+  }
+  // open -j 方式拉起的实例没有 child 句柄，按 profile 路径定位（只杀我们自己的实例）
+  try {
+    const pr = spawnSync("pgrep", ["-f", `user-data-dir=${CFG.chromeProfile}`], { encoding: "utf8" });
+    const pids = String(pr.stdout || "").split(/\s+/).filter(Boolean).map(Number);
+    for (const pid of pids) { try { process.kill(pid, "SIGTERM"); } catch {} }
+  } catch {}
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +451,20 @@ class PageSession {
       throw new Error("页面执行异常: " + String(d).split("\n")[0]);
     }
     return r.result.value;
+  }
+
+  /** 绕过缓存硬刷新页面：签名内含页面加载时的 ts9 时间戳与 version 串，
+   *  若 crc32.min.js 被缓存了旧版（或 ts 过期），签名会被服务端判 Invalid request，
+   *  且单纯 ensureOnSite（只查标题、不重载）永远拿不到新鲜签名 —— 这里用 CDP ignoreCache 重载。 */
+  async hardReload() {
+    try {
+      await this.cdp.send("Page.enable");
+      await this.cdp.send("Page.reload", { ignoreCache: true });
+      await sleep(6000);
+      log("   [i] 已绕缓存硬刷新页面，重新获取站点签名脚本…");
+    } catch (e) {
+      log(`[!] 硬刷新失败（${e.message}），退回普通校验`);
+    }
   }
 
   /** 确保当前页在目标站点且已过 Cloudflare 挑战 */
@@ -436,11 +545,11 @@ class PageSession {
       const key = ${JSON.stringify(String(key))};
       const payload = ${JSON.stringify(payload)};
       const s = crc32(encodeURIComponent(key));
-      const res = await fetch('/api.php', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                   'X-Requested-With': 'XMLHttpRequest' },
-        body: payload + '&s=' + s,
+      // 2026-09-25 站点改版：/api.php 由 POST 改为 GET（js/ajax.js?v=20260925），
+      // 签名算法不变：s = crc32(urlEncode(主参数))，主参数 = id 或 name
+      const res = await fetch('/api.php?' + payload + '&s=' + s, {
+        method: 'GET',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
       });
       const txt = await res.text();
       let json = null; try { json = JSON.parse(txt); } catch {}
@@ -450,7 +559,7 @@ class PageSession {
     let out;
     for (let attempt = 1; attempt <= 3; attempt++) {
       let r;
-      try { r = JSON.parse(await this.evaluate(expr, 60000)); }
+      try { r = JSON.parse(await this.evaluate(expr, 25000)); }
       catch (e) { if (attempt === 3) throw e; await sleep(2000 * attempt); continue; }
 
       if (r.status === 429) {
@@ -458,11 +567,21 @@ class PageSession {
         await sleep(8000);
         continue;
       }
-      if (r.status === 401 || (r.status === 403) || (r.status === 200 && /Invalid request/.test(r.raw || ""))) {
-        // 签名过期 / 挑战失效：重新过一遍
+      // 判定不看状态码：-32001 会话过期实测会以非 200 返回，Invalid request 是 200，
+      // 只要响应体里出现这两种错误就一律硬刷新重签
+      const invalidSig =
+        r.status === 401 || r.status === 403 ||
+        (r.raw && /Invalid request/i.test(r.raw)) ||
+        // 站点后端页面会话过期：页面加载时建立的 session 有 TTL，过期后所有音源
+        // 一律返回 {"code":-32001,"message":"Session with given id not found."}，
+        // 只有重新加载页面拿到新会话才能恢复（2026-09-24 王力宏 14/16 失败即此因）
+        (r.raw && /Session with given id not found/i.test(r.raw));
+      if (invalidSig) {
+        // 签名过期 / 挑战失效 / crc32.min.js 缓存陈旧 / 站点会话过期：硬刷新拿新鲜会话再试
         if (attempt < 3) {
-          log("   [!] 签名或校验失效，重新校验站点…");
+          log("   [!] 签名/会话失效，硬刷新页面后重试…");
           this.signMode = null;
+          await this.hardReload();
           await this.ensureOnSite();
           continue;
         }
@@ -511,6 +630,45 @@ class PageSession {
     } finally { fs.closeSync(fd); }
     await this.evaluate("(() => { window.__gdBuf = null; return 1; })()").catch(() => {});
     return meta.size;
+  }
+
+  /** 最终兜底：让 Chrome 自己把音频下载到临时目录再搬过来。
+   *  浏览器的「下载」不走 CORS（fetchInPage 的页面 fetch 跨域到音频 CDN 必被拦，
+   *  实测报 TypeError: Failed to fetch），这是绕过 CORS 最可靠的办法。返回字节数。 */
+  async downloadViaBrowser(url, filePath) {
+    const tmpDir = path.join(os.tmpdir(), `gd-dl-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+    // Browser.* 属浏览器级命令，页面 session 里发会被拒，单独开一条浏览器级连接
+    const bcdp = new CDP(this.wsUrl);
+    await bcdp.connect();
+    let targetId = null;
+    try {
+      await bcdp.send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: tmpDir });
+      const r = await bcdp.send("Target.createTarget", { url, background: true });
+      targetId = r.targetId;
+      // 轮询临时目录：等 .crdownload 消失且出现实体文件
+      const deadline = Date.now() + 600000;
+      let got = null;
+      while (Date.now() < deadline) {
+        await sleep(3000);
+        const files = fs.readdirSync(tmpDir).filter((f) => !f.startsWith("."));
+        const partial = files.some((f) => f.endsWith(".crdownload") || f.endsWith(".download"));
+        const done = files.filter((f) => !f.endsWith(".crdownload") && !f.endsWith(".download"));
+        if (!partial && done.length > 0) {
+          const cand = done.map((f) => ({ f, s: fs.statSync(path.join(tmpDir, f)).size })).sort((a, b) => b.s - a.s)[0];
+          if (cand && cand.s > 0) { got = cand.f; break; }
+        }
+      }
+      if (!got) throw new Error("600s 内未见下载完成（该 URL 可能被 Chrome 内联播放而非下载）");
+      const size = fs.statSync(path.join(tmpDir, got)).size;
+      fs.renameSync(path.join(tmpDir, got), filePath);
+      return size;
+    } finally {
+      if (targetId) await bcdp.send("Target.closeTarget", { targetId }).catch(() => {});
+      try { await bcdp.send("Browser.setDownloadBehavior", { behavior: "default" }); } catch {}
+      try { bcdp.close(); } catch {}
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    }
   }
 }
 
@@ -647,8 +805,11 @@ async function scanSources(session, query) {
   for (const src of CFG.sources) {
     await politeDelay();
     const name = query.artist ? `${query.title} ${query.artist}` : query.title;
+    // 2026-09-25 站点改版后新增 WAF 校验：查询串含 ' * ( ) 直接 401 Invalid request
+    //（实测 Beggin' / dashstar* / Luv (sic) 全部被拒），故发请求前剔除这些字符
+    const safeName = name.replace(/['*()\[\]（）]/g, " ");
     let sr;
-    try { sr = await session.api({ types: "search", count: 20, source: src, pages: 1, name }); }
+    try { sr = await session.api({ types: "search", count: 20, source: src, pages: 1, name: safeName }); }
     catch (e) { notes.push(`${src}: 搜索失败（${e.message}）`); continue; }
     if (!Array.isArray(sr.json) || sr.json.length === 0) { notes.push(`${src}: 未找到`); continue; }
 
@@ -680,6 +841,85 @@ async function scanSources(session, query) {
 }
 
 // ---------------------------------------------------------------------------
+// 站点歌曲详情（对应站点「歌曲详情」弹窗的全部字段）
+//   歌名/歌手/专辑/时长/来源/歌曲ID/文件大小/播放音质/歌词/封面
+// 数据源 = 同一次搜索命中的 track（name/artist/album/pic_id/lyric_id/duration）
+//        + types=pic（封面 URL） + types=lyric（歌词/翻译）。
+// 抓取后随 .downloaded.json 落盘，flac_metadata_embedder.py 直接复用，
+// 不再依赖已被 Cloudflare 全站拦死、且签名算法已失效的 music-api.* mirror。
+// ---------------------------------------------------------------------------
+async function fetchGdDetails(session, c) {
+  const t = c.track || {};
+  const src = c.src;
+  const details = {
+    track: {
+      id: t.id ?? null,
+      name: t.name ?? null,
+      artist: Array.isArray(t.artist) ? t.artist.map(String) : (t.artist ? [String(t.artist)] : []),
+      album: t.album ?? null,
+      duration: Number(t.extra_data && t.extra_data.duration) || null,
+      source: t.source || src,
+      url_id: t.url_id ?? null,
+      pic_id: t.pic_id ?? null,
+      lyric_id: t.lyric_id ?? null,
+      isrc: (t.extra_data && t.extra_data.isrc) || null,
+      has_hires: !!(t.extra_data && t.extra_data.has_hires),
+    },
+    cover_url: null,
+    cover_size: null,
+    lyric: null,
+  };
+
+  if (t.pic_id) {
+    for (const size of [1000, 640, 500, 300]) {
+      try {
+        await politeDelay();
+        const r = await session.api({ types: "pic", source: src, id: t.pic_id, size });
+        let url = r && r.json && r.json.url;
+        if (!url || url === "err") continue;
+        // 个别音源返回相对路径，补全为站点绝对 URL（同取流处理）
+        if (!/^https?:\/\//i.test(url)) url = `https://${SITE.host}/` + String(url).replace(/^\/+/, "");
+        details.cover_url = String(url);
+        details.cover_size = size;
+        break;
+      } catch (e) {
+        log(`   · 封面获取失败（size=${size}）: ${e.message}`);
+      }
+    }
+    // 站点详情弹窗同样逻辑：去掉 CDN 缩略参数拿原图（netease ?param=WxH）
+    if (details.cover_url) details.cover_url = details.cover_url.replace(/\?param=\d+y\d+$/i, "");
+  }
+
+  if (t.lyric_id) {
+    try {
+      await politeDelay();
+      const r = await session.api({ types: "lyric", source: src, id: t.lyric_id });
+      const j = r && r.json;
+      if (j && j.lyric) details.lyric = { lyric: j.lyric, tlyric: j.tlyric || "" };
+    } catch (e) {
+      log(`   · 歌词获取失败: ${e.message}`);
+    }
+  }
+  return details;
+}
+
+/** --enrich 用：只搜索匹配曲目（不取流），用于给旧索引补抓站点详情 */
+async function findTrackOnly(session, query) {
+  for (const src of CFG.sources) {
+    await politeDelay();
+    const name = query.artist ? `${query.title} ${query.artist}` : query.title;
+    const safeName = name.replace(/['*()\[\]（）]/g, " ");
+    let sr;
+    try { sr = await session.api({ types: "search", count: 20, source: src, pages: 1, name: safeName }); }
+    catch { continue; }
+    if (!Array.isArray(sr.json) || sr.json.length === 0) continue;
+    const { track, score } = pickBest(sr.json, query);
+    if (track && score >= 40) return { src, track, score };
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // 取流（音质降级链）
 // ---------------------------------------------------------------------------
 async function getStream(session, track, src) {
@@ -697,6 +937,9 @@ async function getStream(session, track, src) {
     const j = r.json;
     if (j.br === -2 || j.br === -3) { lastDenied = { ...j, denied: true, br }; continue; }
     if (!j.url || j.url === "err" || j.br === -1) continue;
+    // 2026-09-25 实测：个别音源（apple）会返回相对路径（如 cache/apple_xxx.m4a），
+    // 补全为站点绝对 URL，否则 Node fetch/curl 都无法解析
+    if (!/^https?:\/\//i.test(j.url)) j.url = `https://${SITE.host}/` + String(j.url).replace(/^\/+/, "");
     const actualBr = Number(j.br) > 0 ? Number(j.br) : br;
     return { ...j, requestedBr: br, degraded: actualBr < CFG.br };
   }
@@ -705,8 +948,27 @@ async function getStream(session, track, src) {
   return null;
 }
 
+/** curl 兜底：undici(Node fetch) 对个别 CDN 会报网络层 "fetch failed"（TLS/连接复位等），
+ *  curl 的网络栈更皮实，带 UA/Referer/重试直下。返回字节数。 */
+function curlDownload(url, filePath) {
+  const args = [
+    "-L", "--fail", "--silent", "--show-error", "--location-trusted",
+    "--connect-timeout", "20", "--max-time", "1800",
+    "--retry", "2", "--retry-delay", "3",
+    "-A", UA, "-H", `Referer: https://${SITE.host}/`,
+    "-o", filePath, url,
+  ];
+  const r = spawnSync("curl", args, { timeout: 1800000, encoding: "utf8" });
+  const size = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
+  if (r.status !== 0 || size === 0) {
+    try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+    throw new Error(`curl 失败(退出 ${r.status}): ${String(r.stderr || "").slice(0, 120)}`);
+  }
+  return size;
+}
+
 // ---------------------------------------------------------------------------
-// 文件下载（Node 直连，失败回退页面取流）
+// 文件下载（Node 直连 → curl → Chrome 自下载 → 页面取流）
 // ---------------------------------------------------------------------------
 async function downloadFile(session, url, filePath) {
   const headers = { "User-Agent": UA, Referer: `https://${SITE.host}/` };
@@ -727,7 +989,22 @@ async function downloadFile(session, url, filePath) {
     if (size === 0) throw new Error("下载到 0 字节");
     return size;
   } catch (e) {
-    log(`   [!] Node 直连失败（${e.message}），改用浏览器取流…`);
+    log(`   [!] Node 直连失败（${e.message}${e.cause ? " / " + e.cause : ""}），curl 重试…`);
+    try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+  }
+  try {
+    const size = curlDownload(url, filePath);
+    log(`   [+] curl 直下成功（${(size / 1024 / 1024).toFixed(1)}MB）`);
+    return size;
+  } catch (e) {
+    log(`   [!] ${e.message}，改用 Chrome 自下载兜底…`);
+  }
+  try {
+    const size = await session.downloadViaBrowser(url, filePath);
+    log(`   [+] Chrome 自下载成功（${(size / 1024 / 1024).toFixed(1)}MB）`);
+    return size;
+  } catch (e) {
+    log(`   [!] Chrome 自下载失败（${e.message}），最后试页面取流…`);
     try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
     return await session.fetchInPage(url, filePath);
   }
@@ -765,12 +1042,32 @@ async function downloadOne(session, query, index, total) {
   try { idx = JSON.parse(fs.readFileSync(indexFile, "utf8")); } catch {}
 
   if (!CFG.force) {
-    if (idx[safeBase] && fs.existsSync(path.join(CFG.out, idx[safeBase].file))) {
-      log(`[=] 已存在（索引），跳过: ${idx[safeBase].file}`);
+    const known = idx[safeBase] && fs.existsSync(path.join(CFG.out, idx[safeBase].file));
+    const existing = known ? idx[safeBase].file
+      : (fs.readdirSync(CFG.out).find((f) => f.startsWith(safeBase + ".") && !f.endsWith(".json")) || null);
+    if (existing) {
+      if (CFG.enrich && !(idx[safeBase] && idx[safeBase].track)) {
+        // --enrich：已下载但索引缺站点详情 → 只搜索 + 抓详情，不重新下载
+        log(`[i] 已存在但缺站点详情，补抓中: ${existing}`);
+        const found = await findTrackOnly(session, query);
+        if (found) {
+          const details = await fetchGdDetails(session, found);
+          idx[safeBase] = {
+            ...(idx[safeBase] || { file: existing }),
+            file: existing, src: found.src, site: CFG.site, enriched: Date.now(),
+            track: details.track, cover_url: details.cover_url,
+            cover_size: details.cover_size, lyric: details.lyric,
+          };
+          fs.writeFileSync(indexFile, JSON.stringify(idx, null, 2));
+          log(`[+] 站点详情已补入索引: ${existing}（专辑: ${details.track.album || "?"}，封面: ${details.cover_url ? "有" : "无"}，歌词: ${details.lyric ? "有" : "无"}）`);
+        } else {
+          log(`   · 补抓失败：所有音源均未匹配到「${label}」`);
+        }
+      } else {
+        log(`[=] 已存在，跳过: ${existing}`);
+      }
       return true;
     }
-    const existing = fs.readdirSync(CFG.out).filter((f) => f.startsWith(safeBase + ".") && !f.endsWith(".json"));
-    if (existing.length > 0) { log(`[=] 已存在，跳过: ${existing[0]}`); return true; }
   }
 
   // ---- 阶段一：全源扫描（所有音源都探一遍，不提前挑） ----
@@ -816,9 +1113,20 @@ async function downloadOne(session, query, index, total) {
         : c.ext === "mp3" ? head.startsWith("ID3") || fs.readFileSync(file)[0] === 0xff
         : true;
       if (!ok) throw new Error(`文件校验失败（魔数 ${JSON.stringify(head)} 不是 ${c.ext}）`);
+      // 站点歌曲详情（对应站点「歌曲详情」弹窗：信息/封面/歌词）随索引落盘，
+      // 内嵌器优先复用本地详情，不再依赖已被 Cloudflare 拦死的 mirror API
+      const details = await fetchGdDetails(session, c).catch((e) => {
+        log(`   · 站点详情抓取失败（不影响下载）: ${e.message}`);
+        return null;
+      });
       idx[safeBase] = {
         file: path.basename(file), src: c.src, br: c.stream.br ?? null,
         estKbps: c.estKbps || null, hasHires: c.hasHires || false, size, site: CFG.site, time: Date.now(),
+        url: c.stream.url,
+        track: details ? details.track : null,
+        cover_url: details ? details.cover_url : null,
+        cover_size: details ? details.cover_size : null,
+        lyric: details ? details.lyric : null,
       };
       fs.writeFileSync(indexFile, JSON.stringify(idx, null, 2));
       const actual = await probeAudio(file).catch(() => null);
@@ -882,20 +1190,30 @@ function loadQueries() {
   log(`[i] 音质: br=${CFG.br}${CFG.strictBr ? "（不降级）" : `（可降至 ${CFG.brMin}）`}  音源: ${CFG.sources.join(", ")}`);
   log(`[i] 选源策略: ${CFG.select === "quality" ? "全源扫描 → 按实际码率/无损/Hi-Res 择优" : "首个无损命中即停（--select first）"}`);
   log(`[i] 输出目录: ${CFG.out}   请求间隔: ${CFG.delay}s   ${CFG.losslessOnly ? "仅无损" : "品质优先"}`);
+  if (CFG.enrich) log(`[i] --enrich：已下载但索引缺站点详情的曲目将补抓歌曲信息/封面URL/歌词（不重新下载）`);
 
   const ver = await ensureChrome();
   let session;
   try {
     session = await PageSession.open(ver);
   } catch (e) {
-    // 极少数环境里离屏窗口可能过不了校验：改为显示窗口重试一次
+    // 用户要求「无头、不要弹窗」：校验失败时只重建不可见 Chrome 重试（ensureChrome
+    // 内部会重新按「真无头 → 隐藏实例」轮询），绝不退回任何可见窗口。
     if (!CFG.showWindow && !CFG.attach) {
-      log(`[!] 离屏窗口校验失败（${e.message}），改为显示窗口重试一次…`);
-      closeOwnChrome();
-      await sleep(2500);
-      CFG.showWindow = true;
-      const ver2 = await ensureChrome();
-      session = await PageSession.open(ver2);
+      let lastErr = e;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        log(`[!] 站点会话/校验失败（${lastErr.message}），重建不可见 Chrome 重试（${attempt}/2）…`);
+        closeOwnChrome();
+        await sleep(3000);
+        try {
+          const ver2 = await ensureChrome();
+          session = await PageSession.open(ver2);
+          break;
+        } catch (e2) { lastErr = e2; }
+      }
+      if (!session) {
+        throw new Error(`离屏校验多次失败：${lastErr.message}。可手动登录 Chrome 后加 --attach 复用（仍屏幕外），或检查网络/Cloudflare 状态。`);
+      }
     } else throw e;
   }
   await loadS2T(session);

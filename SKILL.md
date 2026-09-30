@@ -1,9 +1,41 @@
 ---
 name: music-processing-skills
+agent_created: true
 description: >-
   批量下载高品质FLAC音乐（GD音乐台多音源），自动按音乐风格分文件夹管理，
-  并为每首歌内嵌完整元数据（歌名、歌手、专辑、风格、年份、歌词）的完整工作流。
-  当用户要求「下载歌曲」「批量下载音乐」「整理音乐库」「内嵌元数据」「给歌曲加歌词/信息」时使用。
+  下载时顺带抓取站点「歌曲详情」（专辑/封面/歌词+翻译）存入本地索引，内嵌时零 API 直接复用，
+  为每首歌内嵌完整元数据（歌名、歌手、专辑、风格、年份、歌词、封面）的完整工作流。
+  内置 Embeat 歌曲推荐（GD音乐台 AI：按自然语言描述或种子歌推荐相似曲目，可一键转下载）。
+  当用户要求「下载歌曲」「批量下载音乐」「整理音乐库」「内嵌元数据」「给歌曲加歌词/信息」
+  「推荐歌曲」「类似XX的歌」「帮我想点听的音乐」时使用。
+
+## 路径约定
+
+下文命令中使用两个变量，执行前先设置（或替换成你的实际路径）：
+
+```bash
+# 本技能目录（脚本都在 scripts/ 子目录）。按实际安装位置取其一：
+#   WorkBuddy:  $HOME/.workbuddy/skills/music-processing-skills
+#   opencode:   $HOME/.config/opencode/skills/music-processing-skills
+SKILL_DIR="$HOME/.workbuddy/skills/music-processing-skills"
+MUSIC_DIR="$HOME/Documents/automatic downloading music"              # 音乐库根目录（下载存放处）
+```
+
+脚本是**路径无关**的：下载器用 `--out` 指定输出目录，元数据脚本用 `--downloads-dir` 指定要处理的目录。
+所以任何目录都能作为 `$MUSIC_DIR`，不必是上面这个默认值。
+
+## 环境前置检查（首次使用）
+
+```bash
+which node      && node -v        # 下载器需要 Node（零第三方依赖）
+which metaflac  || brew install flac
+python3 -c "import requests, bs4, rapidfuzz, syncedlyrics" \
+  || python3 -m pip install requests beautifulsoup4 rapidfuzz soupsieve syncedlyrics
+```
+
+> 注意：`flac_metadata_embedder.py` 在缺依赖时会**自动**执行 `pip install` / `brew install`。
+> 不想让它自动装系统包的话，先手动装好，脚本检测到存在就会跳过。
+
 ---
 
 # 音乐批量下载与元数据内嵌
@@ -14,8 +46,8 @@ description: >-
 
 ```
 1. 建立音乐风格目录 + JSON 歌单
-2. 批量下载 FLAC（gd-flac-downloader.js，防限流）
-3. 内嵌元数据 + 歌词（flac_metadata_embedder.py）
+2. 批量下载 FLAC（gd-browser-downloader.js）——下载同时抓站点歌曲详情写入 .downloaded.json
+3. 内嵌元数据 + 歌词 + 封面（flac_metadata_embedder.py，优先消费本地详情）
 4. 验证元数据
 ```
 
@@ -66,10 +98,10 @@ def norm(s): return re.sub(r'[\s\-_]+', '', s).lower()
 
 ```bash
 # 解析歌单链接 → 标准 playlist.json（供下载器 --list 使用）
-node playlist-importer.js "https://music.163.com/playlist?id=7403678821" --out downloads/01-xxx/playlist.json
-node playlist-importer.js "https://y.qq.com/n/ryqq/playlist/8612270405" --out playlist.json
-node playlist-importer.js "https://open.spotify.com/playlist/xxx" --out playlist.json
-node playlist-importer.js "歌手 - 歌名" --out playlist.json     # 纯文本直通
+node "$SKILL_DIR/scripts/playlist-importer.js" "https://music.163.com/playlist?id=7403678821" --out downloads/01-xxx/playlist.json
+node "$SKILL_DIR/scripts/playlist-importer.js" "https://y.qq.com/n/ryqq/playlist/8612270405" --out playlist.json
+node "$SKILL_DIR/scripts/playlist-importer.js" "https://open.spotify.com/playlist/xxx" --out playlist.json
+node "$SKILL_DIR/scripts/playlist-importer.js" "歌手 - 歌名" --out playlist.json     # 纯文本直通
 ```
 
 支持平台：网易云（含 163cn.tv 短链）、QQ 音乐、Spotify、酷狗（含短链）、汽水音乐、文本。
@@ -78,8 +110,26 @@ node playlist-importer.js "歌手 - 歌名" --out playlist.json     # 纯文本�
 下载器也可直接吃链接（免去中间文件）：
 
 ```bash
-node gd-flac-downloader.js --playlist "https://music.163.com/playlist?id=xxx" --out <文件夹> --max 10
+node "$SKILL_DIR/scripts/gd-flac-downloader.js" --playlist "https://music.163.com/playlist?id=xxx" --out <文件夹> --max 10
 ```
+
+### ⚠️ 歌单制作经验：曲名/艺人名决定了匹配成败（2026-09-24 大规模实测）
+
+CN 音源（netease/tencent/joox/kuwo）的搜索匹配**强依赖曲名与艺人名**，两类坑实测踩过：
+
+1. **必须用中文曲名**：用 MusicBrainz 抓的英文/罗马音曲名（`Siwei`、`I Want You (Rudejack remix)`…）
+   在 org 上全部 `匹配度不足`（0/12）。换成**中文热门曲名**后立刻能下（崂山道士 15MB / 黑马王子 42MB，
+   24bit/48kHz）。满舒克/艾福杰尼的英文曲名部分能中（10/8），但中文曲名命中率远高。
+2. **artist 必须用平台收录名**：`更高兄弟` 平台收录为 **Higher Brothers**、`功夫胖` 收录为
+   **功夫胖KUNGFU-PEN**——写中文名 12 首全「匹配度不足」，写收录名立刻命中。
+
+**拿正确曲目的方法**：搜不到歌单链接时，用 WebSearch 查「<歌手> 热门歌曲 代表作 / 演唱会歌单」，
+票务网站（黄河票务）和百科（QQ 音乐百科/百度百科）会给出官方歌单级曲目列表，照抄即可。
+
+**按可用性排产**：搜索失败的形态先分类再行动——
+`匹配度不足/未找到` = 曲名或收录名问题 → 改列表重跑；`-32001/Invalid request` = 会话/签名故障 →
+走自愈（见下节）；`找到但下载失败` = 取流问题 → 走取流级联（见下节）。
+反复重试前先看失败形态，别盲试。
 
 ## 步骤 2：批量下载
 
@@ -98,12 +148,12 @@ Node / curl 直连**一律 403 `Just a moment...`**——`music.gdstudio.org`、
 
 ```bash
 # 国际版（满血：netease kuwo joox qobuz tidal apple ytmusic tencent）
-node gd-browser-downloader.js --site xyz --list songs.json --out "downloads/01-xxx" --br 999 --delay 4
-node gd-browser-downloader.js "Resonance - HOME" --site xyz
+node "$SKILL_DIR/scripts/gd-browser-downloader.js" --site xyz --list songs.json --out "<文件夹>" --br 999 --delay 4
+node "$SKILL_DIR/scripts/gd-browser-downloader.js" "Resonance - HOME" --site xyz
 # 国内版（直连，音源被下架过一部分）
-node gd-browser-downloader.js --site org --list songs.json --out "downloads/01-xxx"
+node "$SKILL_DIR/scripts/gd-browser-downloader.js" --site org --list songs.json --out "<文件夹>"
 # 歌单链接直导 / 限数量 / 只要无损
-node gd-browser-downloader.js --playlist "https://music.163.com/playlist?id=xxx" --max 10 --lossless-only
+node "$SKILL_DIR/scripts/gd-browser-downloader.js" --playlist "https://music.163.com/playlist?id=xxx" --max 10 --lossless-only
 ```
 
 CLI 与旧脚本保持一致（`--list` `--playlist` `--sources` `--br` `--br-min` `--strict-br` `--lossless-only`
@@ -111,9 +161,65 @@ CLI 与旧脚本保持一致（`--list` `--playlist` `--sources` `--br` `--br-mi
 可直接接 `flac_metadata_embedder.py`。新增：`--site xyz|org`、`--select quality|first`、`--chrome-port`、
 `--chrome-profile`、`--chrome <路径>`、`--proxy <url>`、`--show-window`（默认窗口在屏幕外）、
 `--keep-chrome`（跑完保留浏览器，下次启动更快；默认跑完自动关掉自己拉起的那个）、
-`--attach`（只复用已开的调试端口，不新拉起）。
+`--attach`（只复用已开的调试端口，不新拉起）、`--enrich`（给旧索引补抓站点详情，见下）。
+
+#### ✅ 下载时顺带抓取站点「歌曲详情」（2026-09-30 新增，替代已死的 mirror 刮削）
+
+站点每首歌都有自己的「歌曲详情」弹窗（歌名/歌手/专辑/时长/来源/歌曲ID/文件大小/播放音质/
+歌词/封面），数据全部来自同一次 search 命中 + `types=pic` + `types=lyric`。
+下载器现在**在下完每首歌后、还在浏览器会话里**时顺手抓齐这些字段，写进 `<out>/.downloaded.json`：
+
+```json
+{
+  "汪苏泷 - 巴赫旧约": {
+    "file": "汪苏泷 - 巴赫旧约.flac", "src": "netease", "br": 999, "size": 26255000, "site": "org",
+    "track": { "id": "165405", "name": "巴赫旧约", "artist": ["汪苏泷"], "album": "巴赫旧约",
+               "duration": 227, "source": "netease", "pic_id": "...", "lyric_id": "...", "has_hires": false },
+    "cover_url": "https://p2.music.126.net/...jpg",
+    "lyric": { "lyric": "[00:01.00]...", "tlyric": "" }
+  }
+}
+```
+
+- 封面 `types=pic` 依次试 1000/640/500/300，成功后按站点同样逻辑去掉 `?param=WxH` 拿原图；
+- 歌词 `types=lyric` 同时拿 `lyric` 与 `tlyric`（翻译）；
+- 抓详情失败**不影响下载**（字段留空，内嵌器回落）；
+- 旧下载的索引条目没有 `track` 字段 → 加 `--enrich` 重跑同一条命令即可补抓（只搜索+抓详情，
+  **不重新下载音频**）：
+
+```bash
+node "$SKILL_DIR/scripts/gd-browser-downloader.js" --list songs.json --out "<文件夹>" --enrich
+```
+
+内嵌器（下一步）会优先消费这份本地详情，专辑/封面/歌词都不再依赖已被 Cloudflare 全站拦截的
+`music-api.*` mirror。**新下载全自动，无需额外操作。**
 
 要求：**Node ≥ 22**（提供内置 WebSocket）+ 本机有 Chrome/Chromium。首次运行会弹出一个独立 Chrome 窗口，属正常。
+
+#### ⚠️ 站点改版追踪（站点会随时升级，下载器须跟着改）
+
+改版判断技巧：看静态资源版本号——`curl` 首页 grep `js/*.js?v=日期`，版本号变了就 diff 一下对应 js。
+GD 音乐台的 js 是**非混淆明文**（只有 `crc32.min.js` 混淆），能直接读出请求方案。
+
+| 日期 | 改动 | 对下载器的影响 |
+|---|---|---|
+| 2026-09-25 | `/api.php` 由 **POST 改为 GET**（`js/ajax.js?v=20260925`），参数名不变（`types/search/url`、`pages=`），签名算法不变 | 老脚本全源 401 `{"detail":"Invalid request."}`——**签名没坏、方式变了**。已在 `api()` 里改成 `fetch('/api.php?'+payload+'&s='+s, {method:'GET'})` |
+| 2026-09-25 | 个别音源取流返回**相对路径**（如 `cache/apple_xxx.m4a`） | Node fetch/curl 都无法解析（`Invalid URL` / 502）。取流前补全 `https://<站点host>/` 前缀（已修） |
+| 2026-09-25 | Cloudflare 无头挑战**间歇性死循环**（"Just a moment..." 刷不过，过几分钟到几小时自愈） | 不是永久封锁，先怀疑限流软禁；换时间重试。另：**下载器运行时绝不要再手动 attach 同一页面的 CDP**——第二个 WebSocket 会挤掉/干扰调试会话，让 evaluate 全部挂起（表现为无任何音源输出地卡住） |
+
+稳健性参数（2026-09-25 调优）：`api()` evaluate 超时 60s→25s（坏会话快速失败换源，避免整夜每首卡 35 分钟）；批量 `--delay` 用 6（站点限流口径 50 次/5 分钟 ≈ 6s/次）。
+
+#### 📏 经验回写规则（standing rule）
+
+每次排障获得新结论（站点改版、新故障模式、新参数），**必须当次回写更新本 skill**，不要只写进对话或记忆——skill 是下次开工时唯一自动加载的经验库。
+
+#### 📏 仓库同步规则（standing rule）
+
+本 skill 有源仓库 GitHub `TommyDucx/automatic-downloading-music`（仓库根目录即 skill 源文件）。
+**每次更新 skill 后必须**：
+1. 同步安装副本，保持与仓库一致：`~/.config/opencode/skills/music-processing-skills/`（SKILL.md + scripts/）与
+   `~/.workbuddy/skills/music-processing-skills/`（脚本在 scripts/ 子目录）；
+2. 把变更 commit 并 push 到 GitHub（`git push origin`），不要留在本地未提交。
 
 #### 选源机制：全源扫描 → 择优（默认 `--select quality`）
 
@@ -161,21 +267,21 @@ GD音乐台被 Cloudflare 拦着，只能靠浏览器绕；**ChKSz API** 是普�
 
 ```bash
 export CHKSZ_KEY=你的密钥
-node chksz-downloader.js --list songs.json --out "downloads/01-xxx" --level jymaster --lyrics
-node chksz-downloader.js "晴天 - 周杰伦" --level hires --out "downloads/01-xxx"
+node "$SKILL_DIR/scripts/chksz-downloader.js" --list songs.json --out "<文件夹>" --level jymaster --lyrics
+node "$SKILL_DIR/scripts/chksz-downloader.js" "晴天 - 周杰伦" --level hires --out "<文件夹>"
 ```
 
 参数：`--key`（或环境变量 `CHKSZ_KEY`）、`--level jymaster|hires|lossless|exhigh|standard`（默认 jymaster，
 拿不到逐档降）、`--strict-level`、`--lossless-only`、`--lyrics`、`--api-base`（可指自建/镜像）、
 以及通用的 `--list/--playlist/--out/--delay/--max/--force`。输出约定与上面完全一致，可接同一个
-元数据内嵌流程。音源调研全文见 `音源调研-2026-09.md`。
+元数据内嵌流程。GitHub 音源调研结论见音乐库根目录的 `音源调研-2026-09.md`。
 
 ### （旧）`gd-flac-downloader.js` —— 直连模式，现已被 Cloudflare 拦截
 
 保留作参考与备用（若将来站点撤掉防护仍可直接用）。用法：
 
 ```bash
-node gd-flac-downloader.js --list <playlist.json> --out <歌曲文件夹> \
+node "$SKILL_DIR/scripts/gd-flac-downloader.js" --list <playlist.json> --out <歌曲文件夹> \
   --sources netease,joox --delay 4
 # 只收无损（没有 FLAC 就报失败，不降级）：加 --lossless-only
 ```
@@ -183,13 +289,13 @@ node gd-flac-downloader.js --list <playlist.json> --out <歌曲文件夹> \
 参数：
 - `--sources`：netease,joox,tencent,kuwo,migu,qobuz,spotify,apple,ytmusic（逗号分隔）
 - `--delay`：请求间隔秒数；默认 3，批量下载务必 ≥4
-- `--br 999|740|320`：目标音质，默认 999（24bit FLAC）
-- `--br-min 320`：音质降级链下限，默认 128。**降级链**：目标 br 拿不到时自动逐档向下试（999→740→320→192→128），同一音源内先降级再换源，借鉴 EchoMusic resolver 的候选降级思路
-- `--strict-br`：关闭降级，目标 br 拿不到就直接换下一音源
 - **格式优先级（默认行为）**：没有无损就存有损里**品质最高**的那份，扩展名按实际格式落盘
   （`.flac` / `.mp3` / `.m4a` / `.ogg`…）。评分 = 无损 +1e6 + 码率，跨音源择优，不是「最后一个说了算」
 - `--lossless-only`（别名 `--flac-only` / `--no-fallback`）：**只要无损**，拿不到就报失败。
   想严格只收 FLAC 时用它；`--fallback` 保留为兼容别名，如今已是默认行为
+- `--br 999|740|320`：目标音质，默认 999（24bit FLAC）
+- `--br-min 320`：音质降级链下限，默认 128。**降级链**：目标 br 拿不到时自动逐档向下试（999→740→320→192→128），同一音源内先降级再换源，借鉴 EchoMusic resolver 的候选降级思路
+- `--strict-br`：关闭降级，目标 br 拿不到就直接换下一音源
 - `--playlist <链接>`：歌单链接直导（网易云/QQ/Spotify/酷狗），免手动写 JSON
 - `--max <n>`：最多下载前 n 首（歌单很大时限制数量）
 - `--force`：已存在也重新下载；不传则已存在文件直接跳过（不耗 API 配额）
@@ -202,17 +308,18 @@ node gd-flac-downloader.js --list <playlist.json> --out <歌曲文件夹> \
 按关键词搜索下载（网易云 / 酷我），自动跳过已存在文件；**同样内置音质降级链**（按音源支持档位从目标档向下）：
 
 ```bash
-node gd-international-downloader.js "Taylor Swift" netease 999 5    # 网易云 FLAC（999 拿不到自动降 320）
-node gd-international-downloader.js "流行音乐" kuwo 320 10        # 酷我 320k
-node gd-international-downloader.js "周杰伦" netease 999 5 cn     # 手动指定镜像
+node "$SKILL_DIR/scripts/gd-international-downloader.js" "Taylor Swift" netease 999 5    # 网易云 FLAC（999 拿不到自动降 320）
+node "$SKILL_DIR/scripts/gd-international-downloader.js" "流行音乐" kuwo 320 10        # 酷我 320k
+node "$SKILL_DIR/scripts/gd-international-downloader.js" "周杰伦" netease 999 5 cn     # 手动指定镜像
 ```
 
 参数：`<关键词> [音源 netease|kuwo] [音质 128|192|320|999] [数量] [镜像 cn|hk|us|default]`
 镜像缺省按音源自动分流：migu/kugou/ximalaya→cn，joox→hk，qobuz/ytmusic→us，其余→默认。
 
 ### 防限流关键（务必遵守）
-站点对连续大量请求会临时限流，症状：
-- 搜索返回 `401 {"detail":"Invalid request."}`
+站点对连续大量请求会临时限流/失效，症状（按出现频率排）：
+- 全源搜索返回 `{"code":-32001,"message":"Session with given id not found."}`（**页面会话过期，非 200**，见下节自愈表）
+- 搜索返回 `401 {"detail":"Invalid request."}`（签名被拒，多为 profile 陈旧，见下节）
 - 下载卡死（401 递归死循环）
 
 对策（已内置到下载器，JS 与 Python 两端一致）：
@@ -250,22 +357,42 @@ s = md5( ts9 + "|" + location.hostname + "|" + version每段补零2位 + "|" + e
 - **结论：不要在 Node 里复刻签名**，直接调页面里的 `crc32()`——顺带免疫站点后续改算法。
   `gd-browser-downloader.js` 的 `ensureSigner()` 会轮询等它就绪
 
-### 浏览器窗口怎么处理（2026-09-19 实测，三条都验过）
+### 浏览器窗口怎么处理（⚠️ 2026-09-24 大翻案：离屏方案作废，真无头翻案成功）
 
-| 方案 | 结果 |
+| 方案 | 结果（2026-09-24 实测，Chrome 153） |
 |---|---|
-| 真无头 `--headless=new` | ❌ **被 Cloudflare 识破**，永远卡在 `Just a moment...`，`crc32` 始终 undefined |
-| 抠出浏览器 `cf_clearance` 给 Node/curl 用 | ❌ **仍然 403**（cf_clearance 绑 IP + TLS 指纹，undici/curl 指纹与 Chrome 差太远） |
-| **有头 Chrome + `--window-position=-4000,-4000`（移出屏幕）** | ✅ 正常过校验，用户看不到窗口 —— **默认就用这个** |
+| **真无头 `--headless=new`（+ compat 参数）** | ✅ **能过 Cloudflare**（`--no-sandbox --disable-gpu --disable-software-rasterizer --disable-dev-shm-usage`，全新 profile 也过）。**首选：零窗口、且比有头快得多**（实测单首 38 秒 vs 有头数分钟）。旧「被识破」结论作废 |
+| **`open -n -j -g -a "Google Chrome.app" --args …` 隐藏实例** | ✅ 备选：App 处于隐藏状态时窗口根本不上屏，无需任何系统权限；无头被拦时用 |
+| 有头 Chrome + `--window-position=-4000,-4000`（移出屏幕） | ❌ **作废**。Chrome 有窗口位置校验，会**把完全离屏的窗口自动拉回可见区域** → 每次启动都弹窗。这就是「总是弹窗」的真因，别再走这条路 |
+| 抠出浏览器 `cf_clearance` 给 Node/curl 用 | ❌ 仍然 403（cf_clearance 绑 IP + TLS 指纹） |
 
-所以 `gd-browser-downloader.js` 现在：
-- 默认把窗口挪到屏幕外（`--show-window` 可改回可见，便于手动干预）
-- 启动后做**存活校验**（端口起来 ≠ 能活，容器/沙箱里 Chrome 自带沙箱会失败导致 GPU 崩溃退出），
-  崩了就自动换 `--no-sandbox --disable-gpu …` 重试，并把可用模式记到 `.gd-flac-cache/chrome-mode.json`，
-  下次直接走对的模式（实测第二次启动从 34s 降到 27s）
-- 跑完**自动关闭自己拉起的 Chrome**（`--keep-chrome` 可保留）；用户自己开的浏览器不受影响
-- 万一离屏窗口过不了校验，会自动改成显示窗口重试一次
+`ensureChrome()` 的现行策略（**绝不弹窗，宁可失败**）：
+1. 只允许两种**真正不可见**的启动模式：`headless` → `hidden`，逐一实测站点校验
+   （`quickSiteCheck`：CDP 开标签到目标站，轮询 `/json/list` 的标题，离开挑战页即通过）
+2. 哪种都过不了就直接报错退出（提示 `--attach` 手动复用），**绝不退回任何可见窗口**
+3. 启动后仍做存活校验（崩了切 compat 参数，记 `.gd-flac-cache/chrome-mode.json`）
+4. 跑完自动关闭自己拉起的 Chrome；`open -j` 拉起的实例没有 child 句柄，
+   `closeOwnChrome()` 用 `pgrep -f "user-data-dir=<profile>"` 兜底定位（只杀自己的实例）
 
+### 会话/签名三类故障与自愈（2026-09-24 实战，全部已内置修复）
+
+| 症状 | 根因 | 自愈 |
+|---|---|---|
+| 全源搜索返回 `{"code":-32001,"message":"Session with given id not found."}` | 站点**页面级 session 有 TTL**，过期后所有音源全挂（实测王力宏 14/16 一次全灭）。⚠️ 该错误**以非 200 状态码返回**，只判 200 会漏 | `api()` 里**不看状态码**、响应体命中即触发 CDP `Page.reload {ignoreCache:true}` 硬刷新拿新会话再重试（原逻辑只 `ensureOnSite` 查标题不刷新页面，永远救不回来） |
+| xyz 全源 `{"detail":"Invalid request."}`（签名被拒） | **共享 profile 里缓存了陈旧的 `crc32.min.js`/会话**（签名内含 version 串与 ts9） | ① 签名失效时同上硬刷新；② **xyz 一律用隔离 profile + 独立端口**（如 `/tmp/gd-xyz-profile` + 9444），别用共享的 `~/.gd-chrome-profile` |
+| 走代理的 xyz 反复「会话失效→刷新→又失效」死循环 | **Clash 负载均衡轮换出口 IP**（实测采样两次 IP 不同），站点会话绑 IP，页面刷新救不了 | **xyz 直连完全可用**（无头直接过 Cloudflare，15 秒下到 FLAC），补缺一律不走代理。旧「国内访问 xyz 需科学上网」假设作废 |
+
+**取流级联**（`downloadFile`，解决「搜索命中但下载失败」）：
+`Node fetch` →（网络层 `fetch failed`，undici 对个别 CDN 不行）→ **curl 兜底**（UA/Referer/重试，
+网络栈更皮实）→ **Chrome 自下载兜底**（`Browser.setDownloadBehavior` + 临时目录 + `Target.createTarget`
+直开音频 URL——浏览器的「下载」不走 CORS）→ 页面取流 `fetchInPage`（**跨域必被 CORS 拦**，
+`TypeError: Failed to fetch`，只当最后手段）。
+
+**并行跑批的防串台**：同时开多个下载任务时，每个任务必须用**独立的 `--chrome-port` + `--chrome-profile`**
+（实测组合：9333=主 org / 9444=xyz 补缺 / 9555=第二路 org）。共享端口会复用对方的标签页并把
+`location.href` 导航到自己的站点，把对方任务打崩。
+⚠️ 杀后台链的教训：链式 bash 脚本的**命令行全文**可被 `pkill -f` 匹配到，会连链一起误杀；
+要么用更精确的特征（profile 路径/端口），要么把匹配串分段写（`pkill -f "xxx_""yyy"`）。
 
 
 ### ⚠️ 假限流：查询串含 `(` `)` `'` 时搜索必失败（实测 2026-08-29）
@@ -274,12 +401,19 @@ s = md5( ts9 + "|" + location.hostname + "|" + version每段补零2位 + "|" + e
 `搜索失败（签名校验失败（可能触发站点限流，请稍后再试））`，**看起来像被限流，其实不是**——
 同一时刻换成纯 ASCII 标题立刻正常返回（命中或 `未找到匹配曲目`）。
 
-原因：`encodeURIComponent` **不会**转义 `!'()*-._~`，这些字符原样进入 form body 后服务端算出的
+原因：`encodeURIComponent` **不会**转义 `!'()*-._~`，这些字符原样进入请求后服务端算出的
 签名与本地不一致。凡是 `(` `)` `'` 参与的查询都会挂。
+（2026-09-25 复测：改 GET 后行为一致——`Luv (sic) Grand Finale` 401，`Dancing With Your Ghost`
+200，`&` `+` `#` `/` `%` `?` 都没事。**黑名单就是 `'` `*` `(` `)`**。）
+
+**2026-09-25 起下载器已自动清洗**：`scanSources()` 里 `name.replace(/['*()\[\]（）]/g," ")` 后再发，
+不会再踩这个坑；本节保留供手工调试/复刻时参考。
+
+有效曲名对照：
 
 | 想下的曲名 | 报错 | 改用 | 结果 |
 |---|---|---|---|
-| `Luv(sic) Part 2` | 签名校验失败 | `Luv sic Part 2` | netease 命中（可能匹配到 A Cappella 版，音质低） |
+| `Luv(sic) Part 2` | 签名校验失败 | `Luv sic Part 2` | netease 命中（但可能匹配到 A Cappella 版，音质低） |
 | `Luv(sic) Part 3` | 签名校验失败 | `Luv sic Part 3` | 同上 |
 | `World's End Rhapsody` | 签名校验失败 | `Worlds End Rhapsody` | 各源均 `未找到匹配曲目`（是真的没有，不是限流） |
 
@@ -288,21 +422,93 @@ s = md5( ts9 + "|" + location.hostname + "|" + version每段补零2位 + "|" + e
 `Part 2` / `Part 3` 都指向同一首 `Luv(Sic)`，下到两个 30MB 的**完全相同**文件），
 下完务必 `shasum` 查重再入库。
 
+## 扩展：Embeat 歌曲推荐（按描述 / 按种子歌，2026-09-25 接入）
+
+**Embeat 是 GD音乐台自家的推荐系统**（开源：https://github.com/gdstudio-org/Embeat）：
+EmbeatMLP 声学向量（"听起来像"）+ Track2Vec 歌单协同过滤（"大众口味"）+ 6291 个微流派标签，
+多路召回融合，6291 micro-genre 覆盖 200 万歌手，冷门歌表现极稳。**线上 API 免部署直接可用**，
+返回标准曲目列表（结构与 search 相同），可直接接 `--list` 下载。
+
+### 推荐决策树（拿到用户需求后怎么用）
+
+| 用户诉求 | 用法 |
+|---|---|
+| 「推荐一些**类似 XX** 的歌」 / 「和 XX 听感像的」 | `embeat_by_track`，种子歌 = XX |
+| 纯描述/心情/场景（「深夜学习的轻柔 jazz hiphop」「健身蹦迪」） | `embeat_agent`（站点官方"AI 深度分析"，直接吃自然语言） |
+| 「推荐 XX 歌手风格的新歌」 | 先 search 歌手热门曲 → 用它当 `embeat_by_track` 种子 |
+| 描述里点出了具体歌名 | 优先 `embeat_by_track`（描述匹配不如种子精准） |
+
+推荐结果 → 挑几首 → 直接拼进 `--list` JSON 用 `gd-browser-downloader.js` 下载，一气呵成。
+
+### 接口契约（从 `js/ajax.js?v=20260925` 逆向，权威；站点改版后需复核）
+
+两个都是**同源 GET**、签名规则与搜索完全一致（`s=crc32(String(urlEncode(主参数)))`）：
+
+```js
+// ① embeat_agent：自然语言描述推荐（rem.type === 'embeat_agent' 走 ajaxSearch 通用路径）
+//    name = urlEncode(用户的描述原文)
+GET /api.php?types=embeat_agent&count=20&source=<source>&pages=1&name=<urlEncode(描述)>&s=<crc32(String(urlEncode(描述)))>
+
+// ② embeat_by_track：种子歌推荐（函数 ajaxEmbeat）
+//    name = urlEncode(JSON.stringify({name, artist, id, isrc}))
+//    - artist 取逗号分隔的第一位；id=Spotify track id（可空）；isrc（可空）；name+artist 必填其一组合
+//    - source 不支持 bilibili；返回同 search 的曲目数组
+GET /api.php?types=embeat_by_track&count=20&source=<source>&pages=1&name=<urlEncode(JSON)>&s=<crc32(String(urlEncode(JSON)))>
+```
+
+⚠️ 查询串 WAF 黑名单同样适用（`'` `*` `(` `)` 会 401，见《假限流》节）——描述里带括号/撇号先清洗。
+
+### 怎么调（复用下载器的浏览器内核机制）
+
+页面上下文内发起（Cloudflare 后面，必须真浏览器；Node 直连拿不到）：
+
+```bash
+# 现成测试脚本（启动无头 Chrome → 过盾 → 页面里发签名请求，两个接口各测一次）：
+node "$SKILL_DIR/scripts/embeat_page_test.js"
+# 里面 eval 的两个 fetch 就是模板：把描述/种子替换后即可当推荐调用用
+```
+
+把 `embeat_page_test.js` 里的 fetch 部分抽出来就是推荐函数；返回 JSON 数组每项含
+`name / artist(数组或字符串) / album / sources / score`，与 `search` 结果同构，可直接喂下载器。
+
+### ⚠️ CF 时段问题（2026-09-25 全天实测规律）
+
+无头 Chrome 过 Cloudflare 挑战**间歇性失败**：上午/清晨放行率高，午后/晚间常死循环
+（"Just a moment..." 永过不去），换代理出口、换全新 profile 都未必救得回来，**过几小时会自愈**。
+对策：过不了盾就换时段重试，别硬刚；要立刻用就 `--show-window` 或 `--attach` 人工过一次盾复用会话。
+
+### 备选：本地自部署 Embeat（离线/大批量推荐才值得）
+
+```bash
+git clone https://github.com/gdstudio-org/Embeat && cd Embeat
+conda create -n embeat python=3.10 && conda activate embeat
+pip install -r requirements.txt   # 需 Qdrant 服务 + 下载 2GB+ 向量库（2GB RAM 即可跑）
+cd infer
+python Embeat.py -s "晴天 - Jay Chou"   # 也支持 -t <Spotify track id> / -t <ISRC> / -a <歌手>
+python Embeat.py -t '适合深夜的轻柔爵士hiphop'   # GitHub README 未列出 agent 子命令，以 -h 为准
+```
+
 ## 步骤 3：内嵌元数据
+
 
 用 `flac_metadata_embedder.py`（Python + metaflac）批量处理：
 
 ```bash
-python3 flac_metadata_embedder.py --downloads-dir <项目根目录>
+python3 "$SKILL_DIR/scripts/flac_metadata_embedder.py" --downloads-dir <项目根目录>
 # 单文件：
-python3 flac_metadata_embedder.py --single-file "path/to/song.flac"
+python3 "$SKILL_DIR/scripts/flac_metadata_embedder.py" --single-file "path/to/song.flac"
 # 可选参数：
-#   --gd-source netease|kuwo|qobuz|joox|migu|ytmusic   刮削音源（默认 netease）
+#   --gd-source netease|kuwo|qobuz|joox|migu|ytmusic   在线刮削音源（本地详情缺失时才用，默认 netease）
 #   --no-cover                                        不内嵌封面
-#   --no-gdmusic                                      完全不用 GD音乐台 API（跳过封面/翻译/歌词兜底）
+#   --no-gdmusic                                      完全不用 GD音乐台数据（本地 .downloaded.json 详情 + 在线刮削都跳过）
 ```
 
 依赖：`brew install flac`（提供 metaflac）+ `pip3 install syncedlyrics requests beautifulsoup4 rapidfuzz soupsieve`。
+
+> ✅ **信息/封面/歌词优先来自下载时抓取的站点详情**（`<文件夹>/.downloaded.json` 里的
+> `track` / `cover_url` / `lyric` 字段，由 `gd-browser-downloader.js` 写入）。
+> 零 API 请求、不依赖已被 Cloudflare 拦死的 `music-api.*` mirror。
+> 旧下载缺详情时：`gd-browser-downloader.js ... --enrich` 补抓一次即可。
 
 ### 内嵌的字段（Vorbis 注释）
 `TITLE` `ARTIST` `ARTISTS` `ALBUM` `ALBUMARTIST` `COMPOSER` `GENRE` `DATE` `TRACKNUMBER` `TOTALTRACKS` `COMMENT` + `LYRICS` + `LYRICS_TRANSLATED` + **封面（PICTURE 块）**
@@ -311,23 +517,30 @@ python3 flac_metadata_embedder.py --single-file "path/to/song.flac"
 - `TITLE/ARTIST`：从文件名 `歌手 - 歌名.flac` 解析
 - `GENRE`：优先查内置映射表（Synthwave-Chillwave → "Synthwave, Chillwave" 等）；
   未命中则**从目录名的 StyleTag 推导**（`Jazzhop-Lo-fi-Hip-Hop` → `Jazzhop, Lo-fi, Hip-Hop`，
-  内置复合词表保证 `Lo-fi` / `Hip-Hop` 不会被切成两个词）；
-  再推导不出才回落 `Electronic` 并**打印告警**（不再静默写错值）
-- `ALBUM`：**优先取 GD音乐台刮削到的真实专辑名**（`modal soul` → `Modal Soul`）；
-  刮不到才回落到「歌手 → 内置专辑表」，再兜底 `{歌手} Collection`
-- `DATE/COMPOSER`：仍按歌手查内置表 —— ⚠️ 搜索接口不返回年份，所以 DATE 是**歌手级近似值**，
+  内置复合词表保证 `Lo-fi` / `Hip-Hop` 不被切成两个词）；再推导不出才回落 `Electronic` 并**告警**
+- `ALBUM`：**优先取本地站点详情里的真实专辑名**（`track.album`，`modal soul` → `Modal Soul`）；
+  本地没有才在线刮削；再取不到才回落「歌手 → 内置专辑表」，最后兜底 `{歌手} Collection`
+- `DATE/COMPOSER`：仍按歌手查内置表 —— ⚠️ 搜索接口不返回年份，DATE 是**歌手级近似值**，
   一首歌跨专辑时可能不准（已知局限，暂无数据源可修）
 - `TRACKNUMBER`：在 playlist.json 中的序号；未匹配默认 1
-- `LYRICS`：syncedlyrics 搜索（**固定 providers = Lrclib,NetEase**），失败换 `https://api.lrc.cx/api/v1/lyrics/single`；再失败走 GD音乐台 `types=lyric` 兜底；**先写 lrc 文件到歌曲文件夹，再读内容内嵌**
-- `LYRICS_TRANSLATED`：GD音乐台 `types=lyric` 返回的 `tlyric` 翻译歌词
-- **封面（PICTURE）**：GD音乐台搜索 -> 取 `pic_id` -> `types=pic`（尺寸 1000/640/500/300 回退）-> 带 Referer 下载 -> `metaflac --import-picture-from` 内嵌
+- `LYRICS`：syncedlyrics 搜索（**固定 providers = Lrclib,NetEase**），失败换 `https://api.lrc.cx/api/v1/lyrics/single`；再失败用下载时抓取的站点歌词（`.downloaded.json` 的 `lyric.lyric`），最后才在线 `types=lyric`；**先写 lrc 文件到歌曲文件夹，再读内容内嵌**
+- `LYRICS_TRANSLATED`：站点详情的 `lyric.tlyric`（在线兜底则是 `types=lyric` 的 `tlyric`）
+- **封面（PICTURE）**：下载时抓到的 `cover_url` 直链（CDN 直连）下载 -> `metaflac --import-picture-from` 内嵌；
+  本地没有才回落「搜索 -> `pic_id` -> `types=pic`（尺寸 1000/640/500/300 回退）」
 - 歌词入 Vorbis 注释前需清洗：去掉 `[00:00.00]` 时间戳行与元信息行（`作曲:` `作词:` 等），否则 `--import-tags-from` 会报 malformed vorbis comment
-- **一次搜索三处复用**：`resolve_gd_track()` 按 (曲名, 歌手) 缓存搜索命中，
+- **一次搜索三处复用**：本地无详情时 `resolve_gd_track()` 按 (曲名, 歌手) 缓存搜索命中，
   专辑名 / 封面 / 歌词共用同一次搜索，避免每首歌重复打 2~3 次 API（省配额、降限流概率）
 
-### GD音乐台刮削（封面/翻译歌词）参考实现
+### 本地站点详情（`resolve_local_meta`，2026-09-30 新增，首选）
+- 读取歌曲文件夹的 `.downloaded.json`，按 `file` 字段（落盘文件名）精确匹配曲目；
+  命中则专辑/封面/歌词/翻译全部直接用，不再打任何镜像 API
+- 找不到详情时静默回落在线刮削；`--no-gdmusic` 则两者都跳过
+- 数据来源与站点「歌曲详情」弹窗完全一致（见「步骤 2」的说明）
+
+### GD音乐台在线刮削（仅本地详情缺失时报底）参考实现
 - 接口形态与签名参考 [gdstudio-embeded-service](https://github.com/Azincc/gdstudio-embeded-service)（types=search/pic/lyric、封面尺寸回退、tlyric 翻译、镜像分流）
-- 签名沿用本站实测有效的 crc32 方案：`s = crc32Hex(encodeURIComponent(name 或 id))`，POST 到 `<mirror>/api.php`
+- ⚠️ **`music-api.*` mirror 已被 Cloudflare 全站拦截**（2026-09 实测），此路径只在本地详情缺失时尝试，大概率失败——正确姿势是 `--enrich` 补本地详情
+- 签名沿用旧 crc32 方案：`s = crc32Hex(encodeURIComponent(name 或 id))`，POST 到 `<mirror>/api.php`
 - **镜像分流**（缺省按音源自动选）：migu/kugou/ximalaya → `music-api-cn.gdstudio.xyz`，joox → `music-api-hk.gdstudio.xyz`，qobuz/ytmusic → `music-api-us.gdstudio.xyz`，其余 → `music-api.gdstudio.xyz`
 - 请求失败按 1s,2s,4s,8s... 指数退避重试（上限 30s），符合站点限流口径（约 50 次/5 分钟）
 
@@ -335,6 +548,12 @@ python3 flac_metadata_embedder.py --single-file "path/to/song.flac"
 - **不要**用 `--import-tags-from <lrc>` 直接导入歌词（时间戳行非法），要用 `--set-tag "LYRICS=<清洗后文本>"`
 - 文件名非 `歌手 - 歌名` 格式（如纯中文歌名）解析不到歌手/歌名，会跳过 → 手动改名或单独补元数据
 - 封面内嵌前必须 `metaflac --remove --block-type=PICTURE` 清掉旧封面，否则重复堆积
+- **（2026-09-25 实测）软链文件夹名必须以 `0X-` 开头**：embedder 的文件发现只 glob
+  `<downloads_dir>/downloads/0*`，把 SD 卡目录软链成 `/tmp/embed_x/downloads/MSW-马思维-…`
+  会扫到 **0 个文件**（总文件数 0，静默"成功"）。改成 `01-马思维-JazzHop-Hip-Hop` 后 38/38 正常内嵌。
+- **（2026-09-25 实测）后台 bash 链里的 node 下载进程跑约 5 分钟会被 SIGTERM**
+  （org/xyz 两次独立复现，exit 143）。对策：歌单大时不要指望一条链跑完，
+  用「skip-existing + 分轮补跑」——重跑同一条命令会跳过已下曲目、只补缺口，第二轮即可跑完。
 
 ### 非 FLAC 音频：用 `download_lyrics.py` 单独补歌词
 
@@ -344,11 +563,11 @@ python3 flac_metadata_embedder.py --single-file "path/to/song.flac"
 
 ```bash
 # 批量：递归扫目录，在每个音频旁生成同名 .lrc（已存在则跳过）
-python3 download_lyrics.py "<目录>" --delay 0.4
+python3 "$SKILL_DIR/scripts/download_lyrics.py" "<目录>" --delay 0.4
 
 # 单曲
-python3 download_lyrics.py --title "Blinding Lights" --artist "The Weeknd" --out "<目录>"
-python3 download_lyrics.py --song "Taylor Swift - Fortnight" --out ./
+python3 "$SKILL_DIR/scripts/download_lyrics.py" --title "Blinding Lights" --artist "The Weeknd" --out "<目录>"
+python3 "$SKILL_DIR/scripts/download_lyrics.py" --song "Taylor Swift - Fortnight" --out ./
 ```
 
 参数：
@@ -381,8 +600,8 @@ metaflac --show-tag=TITLE --show-tag=ARTIST --show-tag=ALBUM --show-tag=GENRE "�
 ### 原版网站（已过时：直连已被 Cloudflare 拦截）
 ```bash
 # 使用现有的原版下载器
-cd "/Users/tommydu/Documents/automatic downloading music"
-node gd-flac-downloader.js playlist.json
+cd "$MUSIC_DIR"
+node "$SKILL_DIR/scripts/gd-flac-downloader.js" playlist.json
 
 # 注意：会自动检查已下载文件，避免重复下载
 ```
@@ -390,25 +609,25 @@ node gd-flac-downloader.js playlist.json
 ### 国际版网站（新功能）
 ```bash
 # 下载网易云音乐歌曲（自动检查重复）
-cd "/Users/tommydu/Documents/automatic downloading music"
-node gd-international-downloader.js "周杰伦" netease 999 5
+cd "$MUSIC_DIR"
+node "$SKILL_DIR/scripts/gd-international-downloader.js" "周杰伦" netease 999 5
 
 # 下载酷我音乐歌曲（自动检查重复）
-node gd-international-downloader.js "流行音乐" kuwo 320 10
+node "$SKILL_DIR/scripts/gd-international-downloader.js" "流行音乐" kuwo 320 10
 
 # 批量下载歌单（自动跳过已存在文件）
-node gd-international-downloader.js "治愈系合成器" netease 999 20
+node "$SKILL_DIR/scripts/gd-international-downloader.js" "治愈系合成器" netease 999 20
 
 # 手动指定镜像（cn/hk/us/default；缺省按音源自动分流）
 #   migu/kugou/ximalaya→cn，joox→hk，qobuz/ytmusic→us
-node gd-international-downloader.js "周杰伦" netease 999 5 cn
+node "$SKILL_DIR/scripts/gd-international-downloader.js" "周杰伦" netease 999 5 cn
 ```
 
 ### 元数据内嵌
 ```bash
 # 为下载的音乐添加元数据和歌词
-cd "/Users/tommydu/Documents/automatic downloading music"
-python flac_metadata_embedder.py
+cd "$MUSIC_DIR"
+python3 "$SKILL_DIR/scripts/flac_metadata_embedder.py"
 ```
 
 ## 📋 重要提醒
@@ -432,12 +651,14 @@ python flac_metadata_embedder.py
 
 | 域名 | 状态 | API 端点 | 备注 |
 |------|------|----------|------|
-| music.gdstudio.org | ❌ 已被 Cloudflare 拦截 | `/api.php` | 直连 403，需 `gd-browser-downloader.js --site org` |
-| music.gdstudio.xyz | ✅ 可用 | `/api.php` | 需浏览器内核；签名见上方《签名算法》 |
+| music.gdstudio.org | ✅ 可用（直连） | `/api.php` | 需 `gd-browser-downloader.js --site org --proxy "direct://"`（绕开系统代理）；2026-09-25 起 POST→GET、查询串禁 `' * ( )` |
+| music.gdstudio.xyz | ⚠️ 2026-09-25 起国内**直连 TCP 不通**，必须走代理 | `/api.php` | `--site xyz --proxy http://127.0.0.1:7897 --chrome-profile <全新隔离目录>`；⚠️ 旧「xyz 直连可用」结论作废 |
 | music-api.gdstudio.xyz | ❌ 已废弃 | `/api.php` | 全站被拦，且不支持 tencent/qobuz |
 
 **最新进展（2026-09-19）**：GD音乐台已全面置于 Cloudflare 之后，直连路线作废；改用浏览器内核（CDP）下载器，
 并默认「全源扫描 → 按实际码率择优」；音频 CDN 仍由 Node 直连。
+**2026-09-25 补缺实战**：org 缺的 29 首用 xyz 补，全源（netease/joox/kuwo/apple/qobuz/tidal/ytmusic/tencent）
+搜索均正常返回但匹配度全不足 → 这些歌是曲库真没有（日韩地区下架曲/Phonk 冷门），换站点也救不了，别反复重试。
 
 ## 技术实现
 
@@ -500,7 +721,7 @@ curl -X POST "https://music-api.gdstudio.xyz/api.php" \
 ## 📁 目录结构
 
 ```
-/Users/tommydu/Documents/automatic downloading music/
+$MUSIC_DIR/
 ├── downloads/                          # 音乐下载主目录
 │   ├── 01-梦幻复古合成器与波形律动-Synthwave-Chillwave/
 │   ├── 02-空灵未来贝斯与电音切片-Melodic-Future-Bass-Glitch/
@@ -523,7 +744,7 @@ curl -X POST "https://music-api.gdstudio.xyz/api.php" \
 ## 🎯 核心规则
 
 ### 1. 目录配置
-- **主目录**：`/Users/tommydu/Documents/automatic downloading music/downloads`
+- **主目录**：`$MUSIC_DIR/downloads`
 - **分类文件夹**：按音乐类型自动分类
 - **防重复下载**：每次下载前检查文件是否已存在
 
@@ -544,24 +765,24 @@ curl -X POST "https://music-api.gdstudio.xyz/api.php" \
 ### 原版网站（已过时：直连已被 Cloudflare 拦截）
 ```bash
 # 使用现有的原版下载器
-cd "/Users/tommydu/Documents/automatic downloading music"
-node gd-flac-downloader.js playlist.json
+cd "$MUSIC_DIR"
+node "$SKILL_DIR/scripts/gd-flac-downloader.js" playlist.json
 ```
 
 ### 国际版网站（新功能）
 ```bash
 # 下载网易云音乐歌曲
-cd "/Users/tommydu/Documents/automatic downloading music"
-node gd-international-downloader.js "周杰伦" netease 999 5
+cd "$MUSIC_DIR"
+node "$SKILL_DIR/scripts/gd-international-downloader.js" "周杰伦" netease 999 5
 
 # 下载酷我音乐歌曲
-node gd-international-downloader.js "流行音乐" kuwo 320 10
+node "$SKILL_DIR/scripts/gd-international-downloader.js" "流行音乐" kuwo 320 10
 ```
 
 ### 元数据内嵌
 ```bash
 # 为下载的音乐添加元数据和歌词
-python flac_metadata_embedder.py
+python3 "$SKILL_DIR/scripts/flac_metadata_embedder.py"
 ```
 
 ## 🔧 技术特性
