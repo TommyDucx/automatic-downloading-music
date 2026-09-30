@@ -57,8 +57,6 @@ music-processing-skills/
 ├── playlist-importer.js           # 歌单链接导入（网易云/QQ/Spotify/酷狗 → 曲目列表）
 ├── flac_metadata_embedder.py      # 元数据+歌词+封面+翻译 内嵌（Python + metaflac）
 ├── run_all.sh                     # 批量下载驱动（顺序遍历 downloads/0*）
-├── retry_failed.sh                # 失败重试脚本
-├── test_*.js                      # API 逆向测试脚本
 ├── .gd-flac-cache/                # 签名运行时缓存（crc32.min.js / player.js 自动下载）
 └── README.md                      # 项目说明
 ```

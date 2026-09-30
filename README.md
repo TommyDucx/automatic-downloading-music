@@ -24,10 +24,8 @@
 ├── gd-international-downloader.js   # 国际版下载器（网易云/酷我等）
 ├── flac_metadata_embedder.py        # 元数据 + 歌词内嵌（Python + metaflac）
 ├── run_all.sh                       # 批量下载驱动（顺序遍历所有风格文件夹）
-├── retry_failed.sh                  # 失败重试脚本
 ├── SKILL.md                         # 技能说明（完整工作流文档）
-├── README.md                        # 本文件
-└── test_*.js                        # API 逆向测试脚本
+└── README.md                        # 本文件
 ```
 
 ## 系统要求
