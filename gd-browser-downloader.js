@@ -48,6 +48,9 @@
  *   --enrich                对已下载但缺站点详情的旧索引条目，补抓歌曲详情
  *                           （歌名/歌手/专辑/时长/来源/封面URL/歌词）写入 .downloaded.json，
  *                           不重新下载音频；供 flac_metadata_embedder.py 内嵌时直接复用
+ *   --direct                直连模式：不用浏览器，Node 现算站点签名（gd-signer.js）+ curl 调 api.php
+ *                           （2026-09-30 全链路实测通过；更快、不受 Cloudflare 时段影响。
+ *                           签名被拒会自动刷新 crc32.min.js 重试；音频仍由 Node/curl 直接下载）
  *
  * 为什么必须用浏览器（2026-09-19 逆向与实测结论，别再走弯路）：
  *   1) 签名已完全逆向：crc32(x) 内部就是把
@@ -118,6 +121,7 @@ function parseArgs(argv) {
     attach: false,
     showWindow: false,
     enrich: false,
+    direct: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -145,6 +149,7 @@ function parseArgs(argv) {
       case "--attach": cfg.attach = true; break;
       case "--show-window": cfg.showWindow = true; break;
       case "--enrich": cfg.enrich = true; break;
+      case "--direct": cfg.direct = true; break;
       case "--help":
       case "-h":
         console.log(fs.readFileSync(__filename, "utf8").split("*/")[0].replace(/^\/\*\*?/, ""));
@@ -673,6 +678,90 @@ class PageSession {
 }
 
 // ---------------------------------------------------------------------------
+// 直连会话（--direct）：不用浏览器。Node 现算站点签名（gd-signer.js）+ curl 调 api.php
+// 2026-09-30 全链路实测：search/url/pic/lyric/embeat 均通，xyz/org 双站、多音源稳定。
+// ---------------------------------------------------------------------------
+/** curl GET 并解析 JSON，返回 {status, json, raw}（raw 截断 300 字用于错误匹配） */
+function curlJson(url, timeoutSec = 60) {
+  const r = spawnSync(
+    "curl",
+    ["-sS", "--max-time", String(timeoutSec), "-A", UA,
+     "-H", "X-Requested-With: XMLHttpRequest", "-w", "\n%{http_code}", url],
+    { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }
+  );
+  if (r.status !== 0) throw new Error(`curl 失败(退出 ${r.status}): ${String(r.stderr || "").slice(0, 160)}`);
+  const out = r.stdout;
+  const idx = out.lastIndexOf("\n");
+  const body = idx >= 0 ? out.slice(0, idx) : out;
+  const status = idx >= 0 ? (parseInt(out.slice(idx + 1), 10) || 0) : 0;
+  let json = null;
+  try { json = JSON.parse(body); } catch {}
+  return { status, json, raw: body.slice(0, 300) };
+}
+
+class DirectSession {
+  constructor(signer) { this.signer = signer; }
+
+  static async open() {
+    const { loadSigner } = require("./gd-signer.js");
+    const signer = loadSigner(SITE.host);
+    log(`[i] 直连模式就绪：站点签名器已装载（crc32.min.js，version ${signer.version}），全程无浏览器`);
+    return new DirectSession(signer);
+  }
+
+  /** 与 PageSession.api 同构：页面里由 crc32() 签名，这里由 gd-signer 现算 */
+  async api(params) {
+    const { loadSigner } = require("./gd-signer.js");
+    const key = params.id !== undefined && params.id !== null ? params.id
+      : (params.name !== undefined && params.name !== null ? params.name : "");
+    const payload = Object.entries(params)
+      .filter(([, v]) => v !== undefined && v !== null)
+      .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
+      .join("&");
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      let r;
+      try {
+        const s = this.signer.sign(encodeURIComponent(String(key)));
+        r = curlJson(`https://${SITE.host}/api.php?${payload}&s=${s}`, 60);
+      } catch (e) {
+        if (attempt === 3) throw e;
+        await sleep(2000 * attempt);
+        continue;
+      }
+      if (r.status === 429) {
+        log("   [限流 429] 冷却 8s…");
+        await sleep(8000);
+        continue;
+      }
+      const invalidSig =
+        r.status === 401 || r.status === 403 ||
+        (r.raw && /Invalid request/i.test(r.raw)) ||
+        (r.raw && /Session with given id not found/i.test(r.raw));
+      if (invalidSig) {
+        if (attempt < 3) {
+          log("   [!] 签名被拒，刷新 crc32.min.js 后重试…");
+          this.signer = loadSigner(SITE.host, { fresh: true });
+          continue;
+        }
+        throw new Error("签名校验失败: " + String(r.raw || "").slice(0, 120));
+      }
+      if (r.status !== 200) {
+        if (attempt === 3) return r;
+        await sleep(1500 * attempt);
+        continue;
+      }
+      return r;
+    }
+    throw new Error("api.php 请求失败（重试耗尽）");
+  }
+
+  async evaluate() { throw new Error("直连模式没有页面上下文"); }
+  async fetchInPage() { throw new Error("直连模式不支持页面取流（音频由 Node/curl 直接下载）"); }
+  async downloadViaBrowser() { throw new Error("直连模式不支持浏览器下载"); }
+}
+
+// ---------------------------------------------------------------------------
 // 匹配与品质（沿用主下载器的打分逻辑）
 // ---------------------------------------------------------------------------
 // 繁简归一化：站点自带 /js/chinese-s2t.js（joox 等源常返回繁体「周杰倫」，
@@ -683,7 +772,9 @@ async function loadS2T(session) {
   const file = path.join(cacheDir, "chinese-s2t.js");
   try {
     if (!fs.existsSync(file) || fs.statSync(file).size < 100) {
-      const txt = await session.evaluate(`(async () => await (await fetch('/js/chinese-s2t.js')).text())()`);
+      const txt = CFG.direct
+        ? require("./gd-signer.js").curlText(`https://${SITE.host}/js/chinese-s2t.js`)
+        : await session.evaluate(`(async () => await (await fetch('/js/chinese-s2t.js')).text())()`);
       if (txt && String(txt).length > 100) {
         fs.mkdirSync(cacheDir, { recursive: true });
         fs.writeFileSync(file, txt);
@@ -997,6 +1088,10 @@ async function downloadFile(session, url, filePath) {
     log(`   [+] curl 直下成功（${(size / 1024 / 1024).toFixed(1)}MB）`);
     return size;
   } catch (e) {
+    if (CFG.direct) {
+      try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+      throw new Error(`Node 直连与 curl 均失败（直连模式无浏览器兜底）: ${e.message}`);
+    }
     log(`   [!] ${e.message}，改用 Chrome 自下载兜底…`);
   }
   try {
@@ -1190,31 +1285,36 @@ function loadQueries() {
   log(`[i] 音质: br=${CFG.br}${CFG.strictBr ? "（不降级）" : `（可降至 ${CFG.brMin}）`}  音源: ${CFG.sources.join(", ")}`);
   log(`[i] 选源策略: ${CFG.select === "quality" ? "全源扫描 → 按实际码率/无损/Hi-Res 择优" : "首个无损命中即停（--select first）"}`);
   log(`[i] 输出目录: ${CFG.out}   请求间隔: ${CFG.delay}s   ${CFG.losslessOnly ? "仅无损" : "品质优先"}`);
+  log(`[i] 模式: ${CFG.direct ? "直连（Node 签名 + curl，全程无浏览器）" : "浏览器内核（CDP + Cloudflare 挑战）"}`);
   if (CFG.enrich) log(`[i] --enrich：已下载但索引缺站点详情的曲目将补抓歌曲信息/封面URL/歌词（不重新下载）`);
 
-  const ver = await ensureChrome();
   let session;
-  try {
-    session = await PageSession.open(ver);
-  } catch (e) {
-    // 用户要求「无头、不要弹窗」：校验失败时只重建不可见 Chrome 重试（ensureChrome
-    // 内部会重新按「真无头 → 隐藏实例」轮询），绝不退回任何可见窗口。
-    if (!CFG.showWindow && !CFG.attach) {
-      let lastErr = e;
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        log(`[!] 站点会话/校验失败（${lastErr.message}），重建不可见 Chrome 重试（${attempt}/2）…`);
-        closeOwnChrome();
-        await sleep(3000);
-        try {
-          const ver2 = await ensureChrome();
-          session = await PageSession.open(ver2);
-          break;
-        } catch (e2) { lastErr = e2; }
-      }
-      if (!session) {
-        throw new Error(`离屏校验多次失败：${lastErr.message}。可手动登录 Chrome 后加 --attach 复用（仍屏幕外），或检查网络/Cloudflare 状态。`);
-      }
-    } else throw e;
+  if (CFG.direct) {
+    session = await DirectSession.open();
+  } else {
+    const ver = await ensureChrome();
+    try {
+      session = await PageSession.open(ver);
+    } catch (e) {
+      // 用户要求「无头、不要弹窗」：校验失败时只重建不可见 Chrome 重试（ensureChrome
+      // 内部会重新按「真无头 → 隐藏实例」轮询），绝不退回任何可见窗口。
+      if (!CFG.showWindow && !CFG.attach) {
+        let lastErr = e;
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          log(`[!] 站点会话/校验失败（${lastErr.message}），重建不可见 Chrome 重试（${attempt}/2）…`);
+          closeOwnChrome();
+          await sleep(3000);
+          try {
+            const ver2 = await ensureChrome();
+            session = await PageSession.open(ver2);
+            break;
+          } catch (e2) { lastErr = e2; }
+        }
+        if (!session) {
+          throw new Error(`离屏校验多次失败：${lastErr.message}。可手动登录 Chrome 后加 --attach 复用（仍屏幕外），或检查网络/Cloudflare 状态。`);
+        }
+      } else throw e;
+    }
   }
   await loadS2T(session);
 
@@ -1225,7 +1325,9 @@ function loadQueries() {
   }
   console.log(`\n===== 完成：成功 ${ok}，失败 ${fail} =====`);
 
-  if (!CFG.keepChrome) {
+  if (CFG.direct) {
+    log("[i] 直连模式：无浏览器需要关闭");
+  } else if (!CFG.keepChrome) {
     session.cdp.close();
     // 关掉自己拉起的（离屏）Chrome；用户自己开的浏览器不受影响
     closeOwnChrome();

@@ -37,15 +37,10 @@
 "use strict";
 
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
-const vm = require("vm");
-const { spawnSync } = require("child_process");
+const { loadSigner, curlText } = require("./gd-signer.js");
 
 const SITES = { xyz: "music.gdstudio.xyz", org: "music.gdstudio.org" };
-const UA =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
-const CACHE_DIR = path.join(__dirname, ".gd-flac-cache");
 const log = (m) => console.error(m);
 
 // ---------------------------------------------------------------------------
@@ -99,99 +94,16 @@ const CFG = parseArgs(process.argv.slice(2));
 const HOST = SITES[CFG.site];
 
 // ---------------------------------------------------------------------------
-// 网络：一律走 curl（Node fetch/undici 的 TLS 指纹会被站点 WAF 拦）
-// ---------------------------------------------------------------------------
-function curlGet(url, timeoutSec = 60) {
-  const r = spawnSync(
-    "curl",
-    ["-sS", "--max-time", String(timeoutSec), "-A", UA,
-     "-H", "X-Requested-With: XMLHttpRequest", url],
-    { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }
-  );
-  if (r.status !== 0) throw new Error(`curl 失败(退出 ${r.status}): ${String(r.stderr || "").slice(0, 160)}`);
-  return r.stdout;
-}
-
-// ---------------------------------------------------------------------------
-// 签名器：把站点 crc32.min.js 丢进 Node vm 现算（含 /time、hostname、version shims）
-// ---------------------------------------------------------------------------
-function fetchSignerCode(host) {
-  // 缓存按 host 分开；签名被服务端拒绝时会强制刷新
-  const cacheFile = path.join(CACHE_DIR, `crc32-${host}.js`);
-  try {
-    if (fs.existsSync(cacheFile) && fs.statSync(cacheFile).size > 1000) {
-      return fs.readFileSync(cacheFile, "utf8");
-    }
-  } catch {}
-  const code = curlGet(`https://${host}/js/crc32.min.js`);
-  if (code && code.length > 1000) {
-    try { fs.mkdirSync(CACHE_DIR, { recursive: true }); fs.writeFileSync(cacheFile, code); } catch {}
-  }
-  return code;
-}
-
-function loadSigner(host, { fresh = false } = {}) {
-  const cacheFile = path.join(CACHE_DIR, `crc32-${host}.js`);
-  if (fresh) { try { fs.unlinkSync(cacheFile); } catch {} }
-
-  // mkPlayer.version 从 player.js 动态解析（形如 2026.09.25 → 20260925）
-  let version = null;
-  try {
-    const playerJs = curlGet(`https://${host}/js/player.js`);
-    version = (playerJs.match(/version:"([^"]+)"/) || [])[1] || null;
-  } catch {}
-
-  const code = fetchSignerCode(host);
-  if (!code || code.length < 1000) throw new Error("crc32.min.js 拉取失败");
-
-  const ctx = {
-    console, Date, Math, JSON, Object, Array, String, Number, Boolean, RegExp, Error,
-    setTimeout, clearTimeout, setInterval, clearInterval, isNaN, parseInt, parseFloat,
-    encodeURIComponent, decodeURIComponent, unescape, escape, atob, btoa,
-    location: { hostname: host, href: `https://${host}/`, protocol: "https:" },
-    // FakeXHR：/time 是 10 位秒级时间戳，取当前时间即可（签名只取前 9 位，10 秒粒度）
-    XMLHttpRequest: class {
-      constructor() { this.readyState = 0; }
-      open(method, url) { this._url = url; }
-      setRequestHeader() {}
-      send() {
-        const self = this;
-        setTimeout(() => {
-          self.readyState = 4;
-          self.status = 200;
-          self.responseText = String(Math.floor(Date.now() / 1000));
-          try { self.onreadystatechange && self.onreadystatechange(); } catch {}
-          try { self.onload && self.onload(); } catch {}
-        }, 0);
-      }
-    },
-  };
-  ctx.window = ctx; ctx.globalThis = ctx; ctx.self = ctx;
-  vm.createContext(ctx);
-  vm.runInContext(code, ctx);
-  if (version) ctx.mkPlayer = { version };
-  if (typeof ctx.crc32 !== "function") throw new Error("crc32.min.js 未暴露 crc32()");
-
-  return {
-    version: version || "(unknown)",
-    sign: async (input) => {
-      // 极端情况：/time 尚未回填时 crc32 可能抛错，宁可直接抛出去让上层刷新重试
-      return ctx.crc32(input);
-    },
-  };
-}
-
-// ---------------------------------------------------------------------------
-// API：s = crc32(urlEncode(主参数))，与站点前端完全一致
+// 网络与签名：共用模块 gd-signer.js（Node vm 现算站点签名 + curl 发请求）
 // ---------------------------------------------------------------------------
 async function apiCall(signer, params, signInput) {
   const qs = Object.entries(params)
     .filter(([, v]) => v !== undefined && v !== null && v !== "")
     .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
     .join("&");
-  const s = await signer.sign(encodeURIComponent(String(signInput)));
+  const s = signer.sign(encodeURIComponent(String(signInput)));
   const url = `https://${HOST}/api.php?${qs}&s=${s}`;
-  const body = curlGet(url);
+  const body = curlText(url, 60);
   let json = null;
   try { json = JSON.parse(body); } catch {}
   if (json === null) throw new Error(`响应非 JSON: ${body.slice(0, 160)}`);

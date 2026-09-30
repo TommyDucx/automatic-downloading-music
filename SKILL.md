@@ -140,20 +140,33 @@ CN 音源（netease/tencent/joox/kuwo）的搜索匹配**强依赖曲名与艺�
 Node / curl 直连**一律 403 `Just a moment...`**——`music.gdstudio.org`、`music.gdstudio.xyz`、
 `music-api.gdstudio.xyz` 三个域名都一样；但静态 `/js/player.js` 仍返回 200，**很容易误判成「站点还能用」**。
 唯一稳定过法是**真实浏览器**跑完 JS 挑战拿到 `cf_clearance`。
-> 2026-09-30 补充：主站对 curl 的浏览器指纹已放行（带有效签名直连 200，401=仅签名问题），
-> 纯 Node 签名器已落地在 `embeat-recommend.js`（推荐场景不再需要浏览器）；
-> **下载链路仍以浏览器内核为准**（Cloudflare 放行策略会反复，浏览器是最稳的兜底）。
+> 2026-09-30 补充：主站对 curl 的浏览器指纹已放行（带有效签名直连 200，401=仅签名问题）。
+> 纯 Node 签名器已抽成共用模块 `gd-signer.js`，下载器新增 **`--direct` 直连模式**
+> （`embeat-recommend.js` 共用同一签名器）——日常优先直连，浏览器模式继续作为兜底。
 
-新下载器的三段式设计：
+#### 两种运行模式（2026-09-30 起）
+
+| 模式 | 命令 | 特点 |
+|---|---|---|
+| **直连（推荐日常）** | 加 `--direct` | 纯 Node：`gd-signer.js` 把站点 `crc32.min.js` 装进 vm 现算签名 + curl 调 `api.php`；无浏览器、不受 Cloudflare 时段挑战影响；签名被拒自动刷新重试；实测 3~10 秒/首 |
+| 浏览器内核（默认） | 不加参数 | 页面上下文里跑站点自己的 `crc32()`，对站点改动最免疫；受 CF 间歇性挑战影响、启动慢 |
+
+直连实测（2026-09-30）：xyz/org 双站全链路通过（search → url → 下载 → 站点详情抓取），
+连续多轮无失败；多音源扫描正常（qobuz 24bit/48kHz 1411kbps 下载验证通过）；
+`--enrich` 亦可用。直连失效（站点大改签名 shim）时回退浏览器模式，**两条路都在脚本里**。
+
+浏览器模式的三段式设计：
 1. 幂等拉起一个带 `--remote-debugging-port` 的 Chrome（独立 profile `~/.gd-chrome-profile`，校验 cookie 可跨次复用）
 2. 通过 CDP（Node 22 内置 WebSocket，**零第三方依赖**）导航到站点并等挑战通过
 3. **所有 `/api.php` 调用都在页面上下文里用站点自带的 `crc32()` 签名**；
    音频文件在 CDN 上、不受 Cloudflare 保护，仍由 Node 直连流式下载（更快、可校验魔数）
 
 ```bash
+# 直连模式（推荐：无浏览器）
+node "$SKILL_DIR/scripts/gd-browser-downloader.js" "Resonance - HOME" --site xyz --direct
+node "$SKILL_DIR/scripts/gd-browser-downloader.js" --site org --list songs.json --out "<文件夹>" --direct
 # 国际版（满血：netease kuwo joox qobuz tidal apple ytmusic tencent）
 node "$SKILL_DIR/scripts/gd-browser-downloader.js" --site xyz --list songs.json --out "<文件夹>" --br 999 --delay 4
-node "$SKILL_DIR/scripts/gd-browser-downloader.js" "Resonance - HOME" --site xyz
 # 国内版（直连，音源被下架过一部分）
 node "$SKILL_DIR/scripts/gd-browser-downloader.js" --site org --list songs.json --out "<文件夹>"
 # 歌单链接直导 / 限数量 / 只要无损
@@ -165,7 +178,8 @@ CLI 与旧脚本保持一致（`--list` `--playlist` `--sources` `--br` `--br-mi
 可直接接 `flac_metadata_embedder.py`。新增：`--site xyz|org`、`--select quality|first`、`--chrome-port`、
 `--chrome-profile`、`--chrome <路径>`、`--proxy <url>`、`--show-window`（默认窗口在屏幕外）、
 `--keep-chrome`（跑完保留浏览器，下次启动更快；默认跑完自动关掉自己拉起的那个）、
-`--attach`（只复用已开的调试端口，不新拉起）、`--enrich`（给旧索引补抓站点详情，见下）。
+`--attach`（只复用已开的调试端口，不新拉起）、`--enrich`（给旧索引补抓站点详情，见下）、
+`--direct`（直连模式：不用浏览器，Node 现算签名 + curl，见上「两种运行模式」）。
 
 #### ✅ 下载时顺带抓取站点「歌曲详情」（2026-09-30 新增，替代已死的 mirror 刮削）
 
@@ -857,7 +871,8 @@ python3 "$SKILL_DIR/scripts/flac_metadata_embedder.py"
 
 | 文件 | 作用 |
 |------|------|
-| `gd-browser-downloader.js` | **首选下载器**：浏览器内核（CDP）双站通用，过 Cloudflare，Node ≥ 22 零依赖；下载时顺抓站点详情（`--enrich` 可补旧索引） |
+| `gd-browser-downloader.js` | **首选下载器**：双站通用，两种模式——浏览器内核（CDP 过 Cloudflare，默认）与 `--direct` 直连（Node 签名 + curl，无浏览器）；下载时顺抓站点详情（`--enrich` 可补旧索引） |
+| `gd-signer.js` | **离线签名器**（共用模块）：把站点 `crc32.min.js` 装进 Node vm 现算签名；供 `--direct` 与 `embeat-recommend.js` 使用 |
 | `embeat-recommend.js` | **Embeat 推荐客户端（网页版直连）**：Node vm 现算站点签名 + curl 调用，无需浏览器/本地库；支持 `--desc` / `--like` / `--track-id` / `--isrc`，`--out` 写下载器歌单 |
 | `chksz-downloader.js` | **备选下载器**：ChKSz API 直连（无 WAF），免费 apikey 可到超清母带 |
 | `gd-flac-downloader.js` | （旧）直连批量下载器，现被 Cloudflare 拦截，保留作参考 |
