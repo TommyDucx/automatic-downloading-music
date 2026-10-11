@@ -344,6 +344,54 @@ node "$SKILL_DIR/scripts/gd-flac-downloader.js" --list <playlist.json> --out <�
 
 驱动脚本 `run_all.sh` 顺序遍历 `downloads/0*/playlist.json` 逐个文件夹下载，日志写 `/tmp/gdmusic_batch.log`。
 
+### 🆕 补缺渠道：`kugou-downloader.js`（酷狗直连，**无需浏览器 / 无需 key / 无 WAF**，2026-10-11 实测打通）
+
+逆向自 `hoowhoami/EchoMusic`（酷狗概念版客户端）→ 其音源服务端 `MakcRe/KuGouMusicApi`，
+只复刻其中**免登录**的那一段链路。**零第三方依赖**（只用 Node 内置 `crypto` / `fetch` / `zlib`），Node ≥ 18。
+
+```bash
+# 单曲（注意 CLI 约定是「歌名 - 歌手」，与 gd-browser-downloader.js 一致）
+node "$SKILL_DIR/scripts/kugou-downloader.js" "千山万水 - 周杰伦" --out "<文件夹>" --lossless-only
+# 批量（歌单文件与 GD 下载器完全同格式，可直接复用）
+node "$SKILL_DIR/scripts/kugou-downloader.js" --list songs.json --out "<文件夹>" --quality flac --delay 2
+# 先探测：只打印候选 + 各档位是否免费（🔒=VIP），不下载
+node "$SKILL_DIR/scripts/kugou-downloader.js" "晴天 - 周杰伦" --probe
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--quality flac\|320\|128` | 目标音质，默认 `flac`（逐档降级：hires→flac→320→128） |
+| `--lossless-only` | 只要无损，拿不到即失败（不降级） |
+| `--probe` | 只搜索并打印「匹配分 + 候选 + 档位免费情况」，不下载 |
+| `--no-lyric` | 不抓歌词（酷狗歌词是 krcs 库，部分曲目会匹配到翻唱版本） |
+| `--list/--out/--delay/--max/--force` | 语义与 `gd-browser-downloader.js` 一致 |
+
+**取的链路**（三条都是免签名或网页盐签名，**不需要过 Cloudflare、不需要 API key**）：
+
+| 环节 | 端点 | 签名 |
+|---|---|---|
+| 搜索 | `complexsearch.kugou.com/v2/search/song`（`platform=WebFilter`） | 网页盐 `MD5(盐+排序参数+盐).toUpperCase()` |
+| 取流 | `m.kugou.com/app/i/getSongInfo.php?cmd=playInfo&hash=…&from=mkugou` | **无**，直出 `sharefs.kugou.com` CDN 直链 |
+| 歌词 | `krcs.kugou.com/search?keyword=<歌名>` → `/download?fmt=krc` | **无**；KRC 逐字歌词，脚本内部 XOR+zlib 解出并转 `[mm:ss.xx]` LRC |
+| 封面 | 搜索结果 `Image` 字段（`imge.kugou.com`） | 无；`{size}` 占位符替换为 `480` |
+
+产物与 GD 下载器**完全一致**：`<out>/歌手 - 歌名.flac|mp3` + 同名 `.lrc` + `<out>/.downloaded.json`
+（含 `track` / `cover_url` / `lyric`），**可直接接 `flac_metadata_embedder.py`**。
+
+#### ⚠️ 能力边界（务必先读，别把它当万能渠道）
+
+- ✅ **只对「免费曲目」有效**：搜索结果里 `Privilege / HQPrivilege / SQPrivilege` 为 `0` 的才能取到流，
+  并且**可以拿到真无损**（实测 周杰伦《千山万水》32.8MB / 1061kbps，魔数 `664c6143` = fLaC）。
+- ❌ **VIP 曲目拿不到**（《晴天》《海阔天空》等都是 `Privilege=10`）：`m.kugou` 返回 `status:0`，
+  web 侧返回 `30020` + `SSA-CODE`（风控）。概念版「免费听」需要登录态，**本脚本不做登录**。
+  → 主流华语热歌请用 GD 音乐台；酷狗是「**GD 缺的免费曲目 + 逐字歌词**」的补缺渠道。
+- 📉 曲库现实：免费档集中在**独立音乐 / 部分老歌 / 翻唱版本**（翻唱是另一个录音，`--probe` 能看出来，
+  脚本对「查询没写 live/remix、候选带」的情况已按 -80 重罚，不会偷偷换版本）。
+- 🔄 **盐值会轮换**：android 盐实测已失效（恒 `error_code 152`）。失效时的横向换端顺序见
+  `ECHOMUSIC_REFERENCE.md` §9，方法论见 `逆向工程方法论-2026-10.md`。
+- 错误码判据（改签名前先看这个，别走冤枉路）：
+  `20006 err signature`=没带签名｜`152 Parameter Error`=签名**值**错/平台参数错｜`30020`+`SSA-CODE`=签名对但撞风控。
+
 ### （旧）国际版批量下载（gd-international-downloader.js）—— 同样已被 Cloudflare 拦截
 按关键词搜索下载（网易云 / 酷我），自动跳过已存在文件；**同样内置音质降级链**（按音源支持档位从目标档向下）：
 
@@ -588,7 +636,11 @@ python3 "$SKILL_DIR/scripts/flac_metadata_embedder.py" --single-file "path/to/so
 - `DATE/COMPOSER`：仍按歌手查内置表 —— ⚠️ 搜索接口不返回年份，DATE 是**歌手级近似值**，
   一首歌跨专辑时可能不准（已知局限，暂无数据源可修）
 - `TRACKNUMBER`：在 playlist.json 中的序号；未匹配默认 1
-- `LYRICS`：syncedlyrics 搜索（**固定 providers = Lrclib,NetEase**），失败换 `https://api.lrc.cx/api/v1/lyrics/single`；再失败用下载时抓取的站点歌词（`.downloaded.json` 的 `lyric.lyric`），最后才在线 `types=lyric`；**先写 lrc 文件到歌曲文件夹，再读内容内嵌**
+- `LYRICS`：**先复用已存在的同名 `.lrc`**（可能来自 `kugou-downloader.js` 的 KRC 逐字歌词，
+  或手工校对过的版本——比再抓一遍第三方源更可信，也避免同曲两份内容）；没有才走
+  syncedlyrics 搜索（**固定 providers = Lrclib,NetEase**），失败换 `https://api.lrc.cx/api/v1/lyrics/single`；
+  再失败用下载时抓取的站点歌词（`.downloaded.json` 的 `lyric.lyric`），最后才在线 `types=lyric`；
+  **先写 lrc 文件到歌曲文件夹，再读内容内嵌**
 - `LYRICS_TRANSLATED`：站点详情的 `lyric.tlyric`（在线兜底则是 `types=lyric` 的 `tlyric`）
 - **封面（PICTURE）**：下载时抓到的 `cover_url` 直链（CDN 直连）下载 -> `metaflac --import-picture-from` 内嵌；
   本地没有才回落「搜索 -> `pic_id` -> `types=pic`（尺寸 1000/640/500/300 回退）」
@@ -616,6 +668,16 @@ python3 "$SKILL_DIR/scripts/flac_metadata_embedder.py" --single-file "path/to/so
 - **（2026-09-25 实测）软链文件夹名必须以 `0X-` 开头**：embedder 的文件发现只 glob
   `<downloads_dir>/downloads/0*`，把 SD 卡目录软链成 `/tmp/embed_x/downloads/MSW-马思维-…`
   会扫到 **0 个文件**（总文件数 0，静默"成功"）。改成 `01-马思维-JazzHop-Hip-Hop` 后 38/38 正常内嵌。
+- **（2026-10-11 复测加强）软链名以 `2x-`/`3x-` 开头同样漏**：glob 只认首字符 `0`，
+  `20-法老-Rap`、`30-华语精选-CPop` 会被静默跳过且**汇总数字偏小无任何报错**——
+  一定要核对日志里的「总文件数」是否等于预期。多目录统一编号建议 `06x/07x` 段。
+- **（2026-10-11 实测）GENRE 靠软链名的 ASCII 尾缀控制**：`060-法老-Rap` → GENRE=Rap、
+  `071-华语精选-CPop` → CPop；纯 CJK 目录名（法老/蛋堡）会落到 Electronic。
+- **（2026-10-11 实测）lrclib.net 备选歌词源在国内被 DNS 污染**（自签名证书 SSL 错误，
+  no_proxy 也救不了）；GD 镜像歌词 API（music-api-*.gdstudio.xyz）python requests 直连
+  正常（POST+离线 crc32 签名不受主站 CF 影响），歌词主源仍稳。
+- **（2026-10-11 实测）GD 匹配失败的歌会产出完全无标签 FLAC**（tags=None）：跑完后用
+  mutagen 扫一遍 `title` 缺失的文件手工补 title，别只看日志的"成功"。
 - **（2026-09-25 实测）后台 bash 链里的 node 下载进程跑约 5 分钟会被 SIGTERM**
   （org/xyz 两次独立复现，exit 143）。对策：歌单大时不要指望一条链跑完，
   用「skip-existing + 分轮补跑」——重跑同一条命令会跳过已下曲目、只补缺口，第二轮即可跑完。
@@ -897,12 +959,35 @@ python3 "$SKILL_DIR/scripts/flac_metadata_embedder.py"
 | `gd-signer.js` | **离线签名器**（共用模块）：把站点 `crc32.min.js` 装进 Node vm 现算签名；供 `--direct` 与 `embeat-recommend.js` 使用 |
 | `embeat-recommend.js` | **Embeat 推荐客户端（网页版直连）**：Node vm 现算站点签名 + curl 调用，无需浏览器/本地库；支持 `--desc` / `--like` / `--track-id` / `--isrc`，`--out` 写下载器歌单 |
 | `chksz-downloader.js` | **备选下载器**：ChKSz API 直连（无 WAF），免费 apikey 可到超清母带 |
+| `kugou-downloader.js` | **补缺下载器**：酷狗直连（**无浏览器/无 key/无 WAF**，零第三方依赖）；专治 GD 缺的免费曲目，可下真 FLAC + KRC 逐字歌词；VIP 曲目不可下 |
 | `gd-flac-downloader.js` | （旧）直连批量下载器，现被 Cloudflare 拦截，保留作参考 |
 | `gd-international-downloader.js` | （旧）国际版直连下载器，同上 |
 | `run_all.sh` | 顺序跑所有风格文件夹的下载驱动 |
 | `flac_metadata_embedder.py` | 元数据+歌词+封面内嵌（Python + metaflac，**仅 FLAC**） |
 | `download_lyrics.py` | 给**非 FLAC**（mp3/m4a/aac/ogg/wav/wma）单独补 `.lrc`，只写文件不改音频 |
 | `playlist.json` | 每风格文件夹内歌单 |
+
+## 📚 逆向工程方法论（standing rule：每次逆向完必须回写）
+
+站点协议会随时改，**"怎么逆"和"逆到什么"一样重要**。完整方法论见
+`逆向工程方法论-2026-10.md`（本 skill 目录与源仓库各一份，提炼自 [morluto/rea](https://github.com/morluto/rea)），
+各站点的实测结论见 `GDSTUDIO_REFERENCE.md` / `ECHOMUSIC_REFERENCE.md`。
+
+速记要点（踩过坑的）：
+
+1. **先搜有没有现成的逆向实现**（如 `MakcRe/KuGouMusicApi`、`Binaryify/NeteaseCloudMusicApi`），
+   能把签名/盐值/参数一次性拿到，省 90% 工作量；**别一上来就啃混淆 JS**。
+2. **先判定目标类别**（网页 JS / 原生 App API / 二进制 / 打包应用 / 只有流量），
+   再选手段——不同类别最优路径差别极大。
+3. **打通顺序固定**：搜索 → 详情 → **取流** → 歌词。搜索不通就去调取流 = 在错的层级瞎试。
+4. **签名错误码判据**：`20006 err signature`=没带签名｜`152`=签名值错｜`30020`+`SSA-CODE`=撞风控。
+   把 `152` 当业务参数错误 → 会浪费一轮（本项目真实踩过）。
+5. **别纵向死磕，先横向换端**：同一功能往往有多个端点/多套盐（web / android / lite / 移动端老域名），
+   `m.` 与 `krcs.` 这类**移动端老接口常常免签名**，是绕签名的捷径。
+6. **变体写成矩阵一次跑完**（身份参数 × appid/clientver × 端点），只打状态码 + 命中数 + 首条标题。
+7. **结论必须分级**：observed（实测）/ inferred（推断）/ unknown（未覆盖），并写明边界与日期；
+   **脚本头部注释要写逆向来源和失效条件**，否则三个月后没人敢动。
+8. **闭环**：结论 → 写 `*-REFERENCE.md` → 固化成脚本 → 本 skill 三方同步 + push。
 
 ## 版权提醒
 

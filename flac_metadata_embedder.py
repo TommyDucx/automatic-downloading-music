@@ -348,6 +348,20 @@ class FLACMetadataEmbedder:
         save_dir = Path(save_dir) if save_dir else self.downloads_dir
         save_dir.mkdir(parents=True, exist_ok=True)
 
+        # 已有「音频同名」的 .lrc 就复用它，不要重下覆盖：
+        # 来源可能是 kugou-downloader.js 的 KRC 逐字歌词，或手工校对过的版本，
+        # 都比再抓一遍第三方源更可信（也避免同一首歌被写出两份不同内容）。
+        if audio_path is not None:
+            existing = Path(audio_path).with_suffix(".lrc")
+            if existing.exists():
+                try:
+                    txt = existing.read_text(encoding="utf-8", errors="ignore")
+                    if re.search(r"\[\d{1,2}:\d{2}", txt):
+                        print(f"   · 已有同名歌词，复用: {existing.name}（{len(txt.splitlines())} 行）")
+                        return str(existing)
+                except Exception:
+                    pass
+
         lrc_content = None
         fetch = self._lyric_fetcher()
         if fetch:

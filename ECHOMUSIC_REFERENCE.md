@@ -105,3 +105,97 @@
 
 - EchoMusic：`src/main/server.ts`（内嵌 server）、`src/renderer/stores/player/resolver.ts`（音质链路）、`src/renderer/plugins/audioSource.ts`（音源管道）、`src/renderer/utils/kugouVerification.ts`（验证码）、`src/main/external/providers/*.ts`（歌单导入）
 - KuGouMusicApi：`util/request.js`（签名/请求）、`util/helper.js`（签名算法）、`util/generate_simulate.js`（行为指纹）、`module/song_url.js / song_url_new.js / song_url_auth_merge.js`（URL 获取）、`module/search.js`
+
+---
+
+# 补充（2026-10-11）：实测复现 + 内嵌信息 / 歌词链路
+
+> 本节是**实跑结论**，不是读码推断。所有 ✅ 都有当日实测证据；❌ 是当天确定不通的路，
+> 别再重复投入。方法论见 `逆向工程方法论-2026-10.md`。
+
+## 9. 免登录可用通道（实测证据）
+
+EchoMusic 走的是**酷狗概念版（`platform=lite`）登录态 + SSA 行为指纹**，我们复现不了登录。
+但实测发现有**一条完全免登录、免签名、免风控的可用链路**，已固化为
+`kugou-downloader.js`（零第三方依赖，纯 Node 内置 `crypto`/`fetch`/`zlib`）：
+
+| 环节 | 端点 | 签名 | 结果 |
+|---|---|---|---|
+| 搜索 | `complexsearch.kugou.com/v2/search/song`，`platform=WebFilter` | **web 盐**（见下） | ✅ 可用，返回完整字段 |
+| 取流 | `m.kugou.com/app/i/getSongInfo.php?cmd=playInfo&hash=<H>&from=mkugou` | **无** | ✅ 免费曲目直出 `sharefs.kugou.com` CDN 直链 |
+| 歌词 | `krcs.kugou.com/search?keyword=<歌名>` → `/download?fmt=krc` | **无** | ✅ KRC 逐字歌词（XOR+zlib 解出） |
+| 封面 | 搜索结果 `Image` 字段 → `imge.kugou.com/stdmusic/{size}/…` | 无 | ✅ `{size}` 换 `480` 即可 |
+
+**web 签名算法**（与 §3 的 `signatureWebParams` 一致，双盐三明治）：
+```
+signature = MD5( "NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt"
+               + 所有参数按 key 排序后拼 "k=v"（无分隔符）
+               + "NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt" ).toUpperCase()
+```
+搜索必需参数：`keyword / page / pagesize / platform=WebFilter / clientver=2000 /
+clienttime(毫秒) / dfid='-' / mid=MD5(guid) / uuid=String(Date.now()) /
+srcappid=2919 / appid=1014 / iscorrection=1 / privilege_filter=0 / userid=0 / token='' / bitrate=0 / inputtype=0`
+
+**实测能力边界**：
+- ✅ **免费曲目**（搜索结果 `Privilege / HQPrivilege / SQPrivilege` 为 0）可以下到**真无损**：
+  实测 周杰伦《千山万水》`SQFileHash` → 32.8MB、1061kbps、魔数 `664c6143`（fLaC）；
+  《安妮的仙境》→ 7.9MB FLAC。
+- ❌ **VIP 曲目**（`Privilege=10`，如《晴天》《海阔天空》）`m.kugou` 返回 `status:0`，
+  web 侧 `wwwapi` 返回 `err_code 30020` + `SSA-CODE`（风控）。概念版「免费听」要登录态，本脚本不做登录。
+- 结论定位：**酷狗是「补缺渠道」**（无 CF、无 key、纯 HTTP），主渠道仍是 GD 音乐台。
+- 曲库现实：主流华语热歌多为 VIP 免费档拿不到，**免费档集中在独立音乐 / 部分老歌 / 翻唱版本**。
+
+**当天确认走不通的路（省得重复试）**：
+
+| 路 | 现象 |
+|---|---|
+| `gateway.kugou.com` + `AndroidFilter`（android 盐，KuGouMusicApi 默认走法） | 恒 `error_code 152 Parameter Error` —— **android 盐已失效** |
+| 同上换 lite 盐 / 各种 `appid × clientver`（12 组） | 仍 152；换 lite 盐反而回到 `20006 err signature` |
+| 身份参数变体（`dfid` ∈ `-`/24随机/32hex/guid、`uuid`、`mid` 形态，11 组） | 恒 152 ⇒ **与身份参数无关** |
+| `wwwapi.kugou.com/play/songinfo`（web 签名） | `30020` 风控（**签名是对的**，撞人机验证） |
+| `trackercdn.kugou.com/i/v2/?key=md5(hash+kgcloudv2)` | 小写 hash → `Bad key`；大写 → `status:2`（无权限） |
+| `lyrics.kugou.com/v1/search` | 恒 0 字节空响应（任何 appid/clientver 组合） |
+| `krcs.kugou.com/search` 带 `hash` + `album_audio_id` | 恒 404；**只有 `keyword=` 能命中** |
+| 本地起 KuGouMusicApi（`npm install`） | 沙箱内被 SIGTERM；**用纯 HTTP 实测即可，不必起服务** |
+
+**错误码语义（重要）**：`20006 err signature` = 没带/格式不对；
+`152 Parameter Error` = 签名**值**不对或平台参数错；`30020` + `SSA-CODE` = 签名正确但撞风控。
+——把 `152` 当成"业务参数写错"会走一大段冤枉路（见方法论 §3）。
+
+## 10. EchoMusic 如何拿「内嵌信息」与「歌词」
+
+| 需求 | EchoMusic 的做法 | 我们的等价实现 |
+|---|---|---|
+| 读**本地文件内嵌标签** | npm `music-metadata` 的 `parseFile(path,{duration:true,skipCovers:true})` → title/artist/album/year/track/disk/genre（`src/main/media/audioMetadata.ts`）；文件名 `歌手 - 歌名` 作为兜底解析 | `flac_metadata_embedder.py` + `metaflac`（只做 FLAC；非 FLAC 用 `download_lyrics.py` + mutagen） |
+| 写**内嵌标签** | EchoMusic 不写标签（它是播放器，不落盘分发） | 我们反过来：metaflac `--set-tag` + `--import-picture-from` |
+| 取**歌词** | `GET /search/lyric?hash&duration&man=no` → 取 `id`+`accesskey` → `GET /lyric?id&accesskey&decode=true&fmt=krc`，**解码在服务端完成**（KuGouMusicApi `util/util.js::decodeLyrics`），客户端直接拿 `decodeContent` | 本脚本在 Node 侧自己解：base64 → 丢前 4 字节 → 16 字节密钥循环 XOR → `zlib.inflateSync` → 把 KRC `[start,dur]<off,dur,0>字…` 转成标准 `[mm:ss.xx]` LRC |
+| 取**封面** | 搜索结果 `pic` 字段拼 `imge.kugou.com/{尺寸}/{pic}`（`src/renderer/views/search/searchHelpers.ts`） | 同左；`Image` 字段里的 `{size}` 占位符替换成 `480` |
+
+**KRC 解码密钥**（16 字节循环，来自 `KuGouMusicApi/util/util.js`）：
+```
+[64, 71, 97, 119, 94, 50, 116, 71, 81, 54, 49, 45, 206, 210, 110, 105]
+```
+→ 该能力补上了本项目原本没有的**逐字（word-level）歌词**来源；对「山灵只读同名 .lrc」
+的场景尤其有用，且比纯 LRC 更容易做时间轴对齐。
+
+**歌词匹配的两个坑（实测）**：
+1. `keyword` **只能放歌名**：`晴天 周杰伦` → 404，`晴天` → 200；
+2. krcs 只按名字检索，会混入**同名异曲 / 翻唱**（实测《海阔天空》匹配到翻唱版，
+   歌词首行带"本歌曲翻唱由 …提供生产能力"）。→ 脚本加了两道闸门：
+   **候选歌名必须重合** + **时长差 ≤ 6s**，否则宁可不要（防止播放器整首错位）。
+   酷狗曲库对部分歌确实没有歌词（如《千山万水》→404），此时回落
+   `flac_metadata_embedder.py` 的 Lrclib / NetEase 路径。
+
+## 11. 对 §7 结论的修正
+
+原 §7 的表格（音质降级链 / 歌单导入 / 指纹模拟…）仍然成立，但**结论行要改**：
+
+> ~~不建议直接逆向酷狗官方协议（法律风险高、clientver/盐值易腐化、需账号体系）~~
+
+修正为：**值得做，但只做「免登录的免费曲目」这一段**——
+- 代价极低：零第三方依赖、无浏览器、无 WAF、无 key（对比 GD 要过 Cloudflare、ChKSz 要 apikey）；
+- 收益明确：GD 台缺的免费曲目（含真无损）+ 独有的逐字歌词；
+- 边界清晰：VIP 曲目不碰（不逆向登录/SSA），盐值失效时按 §9 的表横向换端；
+- **不引入**生成 `sid/edt` 的行为指纹模拟（`generate_simulate.js` 那套）——那是登录/风控路径的专用武器，
+  我们走免签名端点不需要它，也就没有相应的法律与维护成本。
+
