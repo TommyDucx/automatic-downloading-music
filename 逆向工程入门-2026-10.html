@@ -1,0 +1,1260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>逆向工程入门 · 从零到能上手</title>
+<style>
+  :root{
+    --paper:#F6F3EC; --paper-2:#FFFDF8; --paper-3:#EFEBE1;
+    --ink:#2A2A26; --ink-2:#5C5A52; --ink-3:#8A8578;
+    --line:#E3DED2; --line-2:#D2CBB9;
+    --green:#1F4A3C; --green-2:#2E6B55; --green-pale:#E4EDE6;
+    --amber:#C9701F; --amber-pale:#FAEEDF;
+    --coral:#B4443A; --coral-pale:#F7E7E3;
+    --serif:"Songti SC","STSong","Noto Serif SC",Georgia,serif;
+    --sans:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    --mono:"SF Mono",ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:var(--sans); font-size:16px; line-height:1.85;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1180px; margin:0 auto; padding:0 28px 120px; display:grid;
+        grid-template-columns:250px minmax(0,1fr); gap:56px; align-items:start;}
+  .wrap > *{min-width:0;}
+
+  /* ---------- 封面 ---------- */
+  header.top{grid-column:1/-1; padding:72px 0 44px; border-bottom:1px solid var(--line);}
+  header.top .kicker{font-size:13px; letter-spacing:.22em; color:var(--amber); margin:0 0 18px; font-weight:500;}
+  header.top h1{font-family:var(--serif); font-size:40px; line-height:1.28; margin:0 0 16px; font-weight:400; color:var(--green); letter-spacing:.01em;}
+  header.top p.lede{font-size:16px; color:var(--ink-2); margin:0; max-width:660px;}
+  header.top .meta{margin-top:28px; font-size:13px; color:var(--ink-3);}
+  header.top .meta b{color:var(--green-2); font-weight:500;}
+
+  /* ---------- 侧栏目录 ---------- */
+  aside{position:sticky; top:28px; padding-top:44px; font-size:13.5px;}
+  aside .toc-title{font-size:12px; letter-spacing:.18em; color:var(--ink-3); margin:0 0 14px; font-weight:500;}
+  aside a{display:block; padding:5px 0 5px 12px; color:var(--ink-2); text-decoration:none;
+          border-left:2px solid transparent; line-height:1.5; transition:color .15s,border-color .15s;}
+  aside a:hover{color:var(--green-2);}
+  aside a.on{color:var(--green); border-left-color:var(--amber); font-weight:500;}
+  aside .grp{margin-top:18px;}
+
+  /* ---------- 正文 ---------- */
+  main{padding-top:44px;}
+  section{padding:8px 0 40px; border-bottom:1px solid var(--line);}
+  section:last-of-type{border-bottom:none;}
+  h2{font-family:var(--serif); font-size:27px; font-weight:400; color:var(--green);
+     margin:0 0 6px; line-height:1.35;}
+  h2 .num{display:block; font-family:var(--sans); font-size:12px; letter-spacing:.2em;
+          color:var(--amber); font-weight:500; margin-bottom:8px;}
+  h3{font-size:16.5px; font-weight:500; margin:30px 0 10px; color:var(--green);}
+  p{margin:0 0 15px;}
+  a{color:var(--green-2);}
+  strong{font-weight:500; color:var(--green);}
+  code{font-family:var(--mono); font-size:.87em; background:var(--paper-3);
+       padding:2px 6px; border-radius:4px; color:var(--green); word-break:break-word;}
+  ul,ol{margin:0 0 15px; padding-left:22px;}
+  li{margin-bottom:7px;}
+  hr{border:none; border-top:1px solid var(--line); margin:34px 0;}
+
+  /* ---------- 提示框 ---------- */
+  .box{border-radius:12px; padding:16px 20px; margin:20px 0; font-size:15px; border:1px solid;}
+  .box .lbl{display:block; font-size:12px; letter-spacing:.14em; font-weight:500; margin-bottom:7px;}
+  .box p:last-child{margin-bottom:0;}
+  .box.analogy{background:var(--amber-pale); border-color:#EBD3B0;}
+  .box.analogy .lbl{color:var(--amber);}
+  .box.remember{background:var(--green-pale); border-color:#CBDDD2;}
+  .box.remember .lbl{color:var(--green-2);}
+  .box.warn{background:var(--coral-pale); border-color:#E9CBC5;}
+  .box.warn .lbl{color:var(--coral);}
+
+  /* ---------- 代码 ---------- */
+  pre{background:#243029; color:#DCE6DD; border-radius:12px; padding:16px 18px;
+      overflow-x:auto; font-family:var(--mono); font-size:13px; line-height:1.7; margin:18px 0;}
+  pre .c{color:#8AA595;}   /* 注释 */
+  pre .k{color:#E8B96A;}   /* 关键字/强调 */
+  pre .s{color:#A8CFB4;}   /* 字符串 */
+  pre .b{color:#7FB3D5;}   /* 数字 */
+
+  /* ---------- 表格 ---------- */
+  table{width:100%; border-collapse:collapse; margin:20px 0; font-size:14px; table-layout:fixed;}
+  th,td{text-align:left; padding:11px 13px; border-bottom:1px solid var(--line); vertical-align:top; word-break:break-word;}
+  th{font-weight:500; color:var(--green); background:var(--paper-3); font-size:13px;}
+  td code{font-size:12.5px;}
+
+  /* ---------- 步骤流程图 ---------- */
+  .flow{margin:24px 0; overflow-x:auto;}
+  .flow svg{display:block; min-width:600px; width:100%;}
+
+  /* ---------- 交互实验 ---------- */
+  .lab{background:var(--paper-2); border:1px solid var(--line-2); border-radius:14px;
+       padding:22px 24px; margin:24px 0;}
+  .lab .lab-title{font-size:14px; font-weight:500; color:var(--green); margin:0 0 4px;}
+  .lab .lab-sub{font-size:13px; color:var(--ink-3); margin:0 0 18px;}
+  .field{display:flex; align-items:center; gap:14px; margin-bottom:12px; flex-wrap:wrap;}
+  .field label{width:150px; font-size:13.5px; color:var(--ink-2); flex:none;}
+  .field input{flex:1; min-width:220px; font-family:var(--mono); font-size:13px;
+    padding:9px 12px; border:1px solid var(--line-2); border-radius:8px;
+    background:#fff; color:var(--ink);}
+  .field input:focus{outline:2px solid var(--green-pale); border-color:var(--green-2);}
+  .out{margin-top:6px;}
+  .out .row{display:flex; gap:12px; padding:9px 0; border-top:1px dashed var(--line);
+            font-size:13px; align-items:baseline;}
+  .out .row:first-child{border-top:none;}
+  .out .row .tag{width:118px; flex:none; color:var(--ink-3); font-size:12.5px;}
+  .out .row .val{font-family:var(--mono); font-size:12.5px; word-break:break-all; color:var(--ink);}
+  .out .row .val.hi{color:var(--amber); font-weight:500;}
+  .out .row .val.ok{color:var(--green-2); font-weight:500;}
+  .hint{font-size:12.5px; color:var(--ink-3); margin-top:14px;}
+
+  /* ---------- 小测 ---------- */
+  .quiz .q{padding:16px 0; border-top:1px solid var(--line);}
+  .quiz .q:first-child{border-top:none; padding-top:4px;}
+  .quiz .q .qt{font-size:14.5px; margin-bottom:10px;}
+  .quiz .opt{display:block; padding:8px 12px; margin-bottom:6px; border:1px solid var(--line-2);
+    border-radius:8px; cursor:pointer; font-size:13.5px; background:#fff; transition:.15s;}
+  .quiz .opt:hover{border-color:var(--green-2);}
+  .quiz .opt.right{background:var(--green-pale); border-color:var(--green-2); color:var(--green);}
+  .quiz .opt.wrong{background:var(--coral-pale); border-color:var(--coral); color:var(--coral);}
+  .quiz .exp{display:none; margin-top:10px; font-size:13px; color:var(--ink-2);
+    padding:10px 14px; background:var(--paper-3); border-radius:8px;}
+  .quiz .exp.show{display:block;}
+
+  .kv{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:20px 0;}
+  .kv .c{background:var(--paper-2); border:1px solid var(--line); border-radius:10px; padding:14px 16px;}
+  .kv .c .t{font-size:12px; color:var(--ink-3); margin:0 0 4px;}
+  .kv .c .v{font-size:15px; color:var(--green); font-weight:500; margin:0;}
+
+  footer{grid-column:1/-1; border-top:1px solid var(--line); padding:32px 0 0;
+         font-size:13px; color:var(--ink-3);}
+
+  @media (max-width:900px){
+    .wrap{grid-template-columns:1fr; gap:0; padding:0 20px 80px;}
+    aside{position:static; padding:24px 0; border-bottom:1px solid var(--line);
+          display:flex; flex-wrap:wrap; gap:4px 14px;}
+    aside .toc-title{width:100%;}
+    aside a{padding:4px 0; border-left:none; border-bottom:2px solid transparent;}
+    aside a.on{border-left:none; border-bottom-color:var(--amber);}
+    aside .grp{margin-top:0; display:contents;}
+    header.top{padding:48px 0 32px;}
+    header.top h1{font-size:30px;}
+    main{padding-top:28px;}
+    h2{font-size:23px;}
+    .field label{width:100%;}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <p class="kicker">逆向工程 · 零基础入门</p>
+  <h1>逆向工程入门：<br>从「拆玩具」到能自己上手</h1>
+  <p class="lede">这门课不讲理论堆砌。我们用一个真实的项目当教材——「批量下载音乐并内嵌元数据」——从
+  第一个网络请求开始，一步步拆到签名、风控和取流。读完你应该能独立看懂一个网页 API 的秘密，
+  并且知道什么时候该停手。</p>
+  <p class="meta">案例来源：<b>GD 音乐台</b> · <b>酷狗音乐</b> · <b>ChKSz</b> ·
+  配套方法论文档：<code>逆向工程方法论-2026-10.md</code></p>
+</header>
+
+<aside>
+  <p class="toc-title">目录</p>
+  <a href="#intro">01 逆向工程是什么</a>
+  <a href="#mindset">02 三观：合法边界</a>
+  <a href="#method">03 通用五步法</a>
+  <a href="#http">04 看懂一次网络请求</a>
+  <a href="#signature">05 签名：门禁暗号</a>
+  <a href="#sandbox">06 动手：签名三明治</a>
+  <a href="#case-a">07 实战：推标准签名</a>
+  <a href="#case-b">08 实战：读不懂怎么办</a>
+  <a href="#identity">09 当它看的是「你是谁」</a>
+  <a href="#errors">10 错误码是路标</a>
+  <a href="#pivot">11 别死磕：横向换端</a>
+  <a href="#evidence">12 证据分级</a>
+  <a href="#checklist">13 项目体检表</a>
+  <a href="#pitfalls">14 踩坑集</a>
+  <a href="#glossary">15 术语对照</a>
+  <a href="#next">16 下一步怎么练</a>
+</aside>
+
+<main>
+
+<!-- ============ 01 ============ -->
+<section id="intro">
+  <h2><span class="num">第 01 课</span>逆向工程是什么</h2>
+
+  <p>假设你拿到一个玩具小车，一按遥控器它就跑。你想知道它里面是怎么做到的。两种办法：
+  一是去要设计图纸（如果厂家给你）——这叫<b>看源码</b>；二是把它拆开，看电机、齿轮、电路板怎么连——
+  这叫<b>逆向工程</b>（Reverse Engineering）。</p>
+
+  <div class="box analogy">
+    <span class="lbl">类比</span>
+    <p>逆向工程就像<b>吃到一道好菜，倒推出菜谱</b>。厨师不给你菜谱，你只能靠尝、靠看、靠试：
+    这味道像八角，火候大概三分钟，糖放得不多。你倒推出来的菜谱未必和厨师的一模一样，
+    但<b>能做出一盘很像的菜</b>，这就是目的。</p>
+  </div>
+
+  <p>放到软件世界里，逆向工程的定义是：<b>在不给你源代码和文档的前提下，只根据「现象」，
+  反推出它内部的工作原理。</b></p>
+
+  <p>「现象」可以有很多种：</p>
+  <ul>
+    <li>一个能跑的网页——你能看到它发出的网络请求；</li>
+    <li>一个能听的音乐 App——你能看到它请求了哪些网址；</li>
+    <li>一个能玩的游戏——你能看到它的内存里有什么数字；</li>
+    <li>一个可执行文件（<code>.exe</code>、<code>.app</code>）——你能看到它的机器指令。</li>
+  </ul>
+
+  <h3>最重要的一句话</h3>
+  <div class="box remember">
+    <span class="lbl">记住</span>
+    <p>逆向的产物是<b>「理解」，不是「破解」</b>。理解之后，你可以自己写一个能用的脚本；
+    而「破解」通常意味着破坏别人的保护、绕过付费。这两件事在技术上相邻，在性质上完全不同。</p>
+  </div>
+
+  <p>我们这个项目为什么需要逆向？因为想要批量下载音乐并写入正确的专辑、封面、歌词，
+  就需要一个「能稳定调用的接口」。而很多音乐站点<b>并不提供公开接口</b>。
+  于是只能去看它的网页是怎么拿到歌的，然后<b>照着那个方式，自己搭一条能走的路</b>。</p>
+
+  <h3>逆向能分成几个「地域」</h3>
+  <p>不同目标的难度天差地别，入门阶段先认清这张地图：</p>
+  <table>
+    <thead><tr><th style="width:26%">目标类型</th><th>你怎么观察它</th></tr></thead>
+    <tbody>
+      <tr><td>网页 / 网络接口</td><td>打开浏览器开发者工具，看 Network 面板里的请求。<b>入门从这里开始</b></td></tr>
+      <tr><td>手机 App 的接口</td><td>抓包（手机流量代理到电脑），一样是看请求</td></tr>
+      <tr><td>JavaScript 程序</td><td>把代码下载下来直接读；读不懂就让它跑起来看</td></tr>
+      <tr><td>可执行文件 / 二进制</td><td>需要反汇编器（Hopper、Ghidra、IDA），难度陡增</td></tr>
+    </tbody>
+  </table>
+  <p>本课全程只讲<b>第一类</b>——网页与网络接口的逆向。它门槛最低、见效最快，也覆盖了本项目 90% 的工作。</p>
+</section>
+
+<!-- ============ 02 ============ -->
+<section id="mindset">
+  <h2><span class="num">第 02 课</span>三观：动手之前先划边界</h2>
+
+  <p>这一课很短，但我把它放在最前面。技术能力越强，边界越重要。</p>
+
+  <table>
+    <thead><tr><th style="width:34%">做法</th><th>判断</th></tr></thead>
+    <tbody>
+      <tr><td>自己学习、研究协议原理</td><td>可以。这是技术知识的正常获取</td></tr>
+      <tr><td>访问公开可见的数据（你自己在浏览器里也能看到）</td><td>可以，但要控制频率，别把人家的服务器打崩</td></tr>
+      <tr><td>下载内容仅供自己本地听 / 看</td><td>属于个人使用范畴，但请遵守当地法律和平台条款</td></tr>
+      <tr><td>批量抓取后分发、上传、卖钱</td><td><b>不可以。</b>这是侵权，可能承担法律责任</td></tr>
+      <tr><td>绕过付费、把会员内容白嫖下来</td><td><b>不可以。</b>技术可行 ≠ 可以去做</td></tr>
+      <tr><td>攻击、篡改、影响他人服务</td><td><b>不可以。</b>可能构成违法</td></tr>
+    </tbody>
+  </table>
+
+  <div class="box warn">
+    <span class="lbl">本项目自己定的三条红线</span>
+    <p>1. 不做任何登录态的逆向（不去破解 VIP）；<br>
+       2. 只下载能公开访问的免费内容，且只供自己本地使用；<br>
+       3. 主动限速（每次请求间隔 2～6 秒），不压垮对方服务器。</p>
+  </div>
+
+  <p>有意思的是：<b>边界清楚反而让技术工作更好做</b>。正因为不碰登录态，我们才能选一条
+  「不需要账号、不需要风控对抗」的简单路线——后面第 11 课会看到，这正是通关的关键。</p>
+</section>
+
+<!-- ============ 03 ============ -->
+<section id="method">
+  <h2><span class="num">第 03 课</span>通用五步法</h2>
+
+  <p>不管逆什么，套路是一样的。把它当成肌肉记忆背下来：</p>
+
+  <div class="flow">
+    <svg viewBox="0 0 680 132" role="img" xmlns="http://www.w3.org/2000/svg">
+      <title>逆向工程通用五步法</title>
+      <desc>观察现象、提出假设、做实验、形成定论、回写文档，五个步骤依次进行。</desc>
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="#2E6B55" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+      </defs>
+      <rect x="40" y="40" width="100" height="52" rx="10" fill="#E4EDE6" stroke="#2E6B55" stroke-width="0.5"/>
+      <text x="90" y="60" text-anchor="middle" fill="#1F4A3C" font-size="14" font-weight="500" font-family="sans-serif" dominant-baseline="central">观察</text>
+      <text x="90" y="78" text-anchor="middle" fill="#2E6B55" font-size="12" font-family="sans-serif" dominant-baseline="central">看现象</text>
+      <path d="M142 66 L163 66" fill="none" stroke="#2E6B55" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <rect x="165" y="40" width="100" height="52" rx="10" fill="#E4EDE6" stroke="#2E6B55" stroke-width="0.5"/>
+      <text x="215" y="60" text-anchor="middle" fill="#1F4A3C" font-size="14" font-weight="500" font-family="sans-serif" dominant-baseline="central">假设</text>
+      <text x="215" y="78" text-anchor="middle" fill="#2E6B55" font-size="12" font-family="sans-serif" dominant-baseline="central">猜机制</text>
+      <path d="M267 66 L288 66" fill="none" stroke="#2E6B55" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <rect x="290" y="40" width="100" height="52" rx="10" fill="#E4EDE6" stroke="#2E6B55" stroke-width="0.5"/>
+      <text x="340" y="60" text-anchor="middle" fill="#1F4A3C" font-size="14" font-weight="500" font-family="sans-serif" dominant-baseline="central">实验</text>
+      <text x="340" y="78" text-anchor="middle" fill="#2E6B55" font-size="12" font-family="sans-serif" dominant-baseline="central">只改一处</text>
+      <path d="M392 66 L413 66" fill="none" stroke="#2E6B55" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <rect x="415" y="40" width="100" height="52" rx="10" fill="#E4EDE6" stroke="#2E6B55" stroke-width="0.5"/>
+      <text x="465" y="60" text-anchor="middle" fill="#1F4A3C" font-size="14" font-weight="500" font-family="sans-serif" dominant-baseline="central">定论</text>
+      <text x="465" y="78" text-anchor="middle" fill="#2E6B55" font-size="12" font-family="sans-serif" dominant-baseline="central">能复现</text>
+      <path d="M517 66 L538 66" fill="none" stroke="#2E6B55" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <rect x="540" y="40" width="100" height="52" rx="10" fill="#FAEEDF" stroke="#C9701F" stroke-width="0.5"/>
+      <text x="590" y="60" text-anchor="middle" fill="#8A4A12" font-size="14" font-weight="500" font-family="sans-serif" dominant-baseline="central">回写</text>
+      <text x="590" y="78" text-anchor="middle" fill="#C9701F" font-size="12" font-family="sans-serif" dominant-baseline="central">写下来</text>
+      <text x="340" y="116" text-anchor="middle" fill="#8A8578" font-size="12" font-family="sans-serif">卡住了就退回上一步：多半是假设错了，而不是实验做错了</text>
+    </svg>
+  </div>
+
+  <h3>每一步的意思</h3>
+  <ol>
+    <li><b>观察</b>：看到什么就记什么，不要先解释。比如「点了播放键，浏览器发出了一个请求，
+      网址里有一串 32 位的字符」。</li>
+    <li><b>假设</b>：那 32 位大概是「签名」。<b>假设可以错，但不能没有</b>——没有假设的实验是瞎试。</li>
+    <li><b>实验</b>：<b>一次只改一个变量</b>。改两个，你就不知道是哪个起了作用。</li>
+    <li><b>定论</b>：能反复复现才算结论。只成功过一次的，叫「巧合」。</li>
+    <li><b>回写</b>：写进文档。<b>不回写等于没做</b>——三天后你自己也想不起来当时怎么试出来的。</li>
+  </ol>
+
+  <div class="box analogy">
+    <span class="lbl">类比</span>
+    <p>这就是理科实验课的那一套：观察现象 → 提出假设 → 控制变量 → 得出结论 → 写实验报告。
+    你在物理课上学过的能力，直接就能用。</p>
+  </div>
+
+  <div class="box warn">
+    <span class="lbl">新手最常见的错误</span>
+    <p>跳过「假设」，直接开始乱改参数。看到报错就换一个参数，改了二十次毫无进展。
+    正确姿势是：<b>先想清楚「我猜它怎么判断的」，再设计一个能验证或推翻这个猜测的实验。</b></p>
+  </div>
+</section>
+
+<!-- ============ 04 ============ -->
+<section id="http">
+  <h2><span class="num">第 04 课</span>看懂一次网络请求</h2>
+
+  <p>网页逆向的全部素材，都在一次 HTTP 请求里。先把它的结构认全。用
+  <code>curl</code>（一个命令行工具，macOS 自带）就能看清楚：</p>
+
+  <pre><span class="c"># 模拟浏览器访问酷狗的搜索接口，看看服务器返回什么</span>
+curl -s -A <span class="s">"Mozilla/5.0"</span> \
+  <span class="s">"https://complexsearch.kugou.com/v2/search/song?keyword=%E6%99%B4%E5%A4%A9&page=1&pagesize=3&platform=WebFilter"</span></pre>
+
+  <p>把这条命令拆开，就是一次请求的全部构成：</p>
+
+  <table>
+    <thead><tr><th style="width:22%">部分</th><th style="width:34%">长什么样</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td>域名 / 路径</td><td><code>complexsearch.kugou.com/v2/search/song</code></td>
+          <td>找谁、办什么事</td></tr>
+      <tr><td>查询参数</td><td><code>?keyword=晴天&amp;page=1</code></td>
+          <td>你的具体要求</td></tr>
+      <tr><td>请求头 Header</td><td><code>User-Agent: Mozilla/5.0…</code></td>
+          <td>你是谁、用什么身份来的</td></tr>
+      <tr><td>响应体</td><td>一段 JSON</td>
+          <td>服务器的回答</td></tr>
+    </tbody>
+  </table>
+
+  <div class="box analogy">
+    <span class="lbl">类比</span>
+    <p>把它想成<b>点外卖</b>：<br>
+    域名路径 = 店名 + 你要的服务（下单）；<br>
+    查询参数 = 你要一份不加辣的牛肉面；<br>
+    请求头 = 你的会员卡、手机型号、备注；<br>
+    响应 = 店家回你「已下单，预计 30 分钟」。</p>
+  </div>
+
+  <h3>练习：怎么看到这些</h3>
+  <ol>
+    <li>打开 Chrome，按 <code>F12</code> 打开开发者工具，切到 <b>Network（网络）</b>面板；</li>
+    <li>勾上 <b>Fetch/XHR</b> 过滤，只看数据请求；</li>
+    <li>在网页上做一个操作（比如搜一首歌）；</li>
+    <li>列表里会多出请求。点开任意一条，看 <b>Headers</b>（请求头与参数）和
+        <b>Response</b>（响应内容）。</li>
+  </ol>
+
+  <p>顺手右键那条请求 → <b>Copy as cURL</b>，你就能把这次请求原样重放。
+  这是逆向的第一个实用技巧：<b>先能重复它，才能研究它。</b></p>
+
+  <div class="box remember">
+    <span class="lbl">记住</span>
+    <p>逆向网络接口 = 在浏览器里看它怎么发请求 → 想办法自己发一个一模一样的。
+    所有的难度都集中在「<b>一模一样</b>」这四个字上。</p>
+  </div>
+
+  <h3>那么，为什么不能照抄？</h3>
+  <p>如果你直接拿 Copy as cURL 的请求去重放，很多时候会失败。原因是请求里藏着一些
+  <b>只在当时那一刻有效</b>的东西。常见的有三类：</p>
+  <ul>
+    <li><b>签名</b>——一串哈希，证明「这个请求是我的合法客户端发的」，会随时间变化；</li>
+    <li><b>令牌 / Cookie</b>——你的登录身份；</li>
+    <li><b>指纹信息</b>——你的设备和浏览器特征。</li>
+  </ul>
+  <p>接下来三课，就依次攻这三样。先从最核心的<b>签名</b>开始。</p>
+</section>
+
+<!-- ============ 05 ============ -->
+<section id="signature">
+  <h2><span class="num">第 05 课</span>签名：服务器的门禁暗号</h2>
+
+  <h3>为什么要有签名</h3>
+  <p>服务器面对的是全世界。它需要快速判断：「这个请求是我们的客户端发的，还是别人写的脚本？」
+  最省事的办法就是：<b>约定一个暗号</b>。</p>
+
+  <div class="box analogy">
+    <span class="lbl">类比</span>
+    <p>想象一个秘密俱乐部，进门要报暗号。暗号不能是固定的一句话——那样被听一次就废了。
+    所以约定是：<b>把今天日期 + 暗号本上的词，一起算出个结果报出来</b>。
+    会员有暗号本，能算对；服务员（服务器）也有暗号本，能校验。</p>
+  </div>
+
+  <p>这里用到的数学工具叫<b>哈希函数</b>（最常见的是 MD5）。它有三个性质：</p>
+  <ul>
+    <li><b>同样的输入，永远得到同样的输出</b>（所以能校验）；</li>
+    <li><b>输入改一个字，输出面目全非</b>（所以防篡改）；</li>
+    <li><b>从输出推不回输入</b>（所以泄露了也没关系）。</li>
+  </ul>
+  <p>我们来亲眼看一下第二条：</p>
+
+  <pre><span class="k">md5</span>(<span class="s">"晴天"</span>)      = <span class="b">0f9f8a5c…</span>
+<span class="k">md5</span>(<span class="s">"晴天 "</span>)     = <span class="b">3c1d77e2…</span>   <span class="c">← 只多了一个空格</span>
+<span class="k">md5</span>(<span class="s">"晴天a"</span>)     = <span class="b">b7a91f04…</span>   <span class="c">← 完全看不出关系</span></pre>
+
+  <h3>三种常见形态</h3>
+  <table>
+    <thead><tr><th style="width:24%">形态</th><th style="width:40%">算法</th><th>逆向难度</th></tr></thead>
+    <tbody>
+      <tr><td><b>裸哈希</b></td><td><code>hash(参数)</code></td>
+          <td>最容易，但服务端也最容易被冒充，现实中少见</td></tr>
+      <tr><td><b>加盐哈希</b></td><td><code>hash(盐 + 参数 + 盐)</code></td>
+          <td>需要「盐」这个秘密词。<b>本项目酷狗就是这种</b>，能离线复刻</td></tr>
+      <tr><td><b>混淆 / 改造哈希</b></td><td>把算法本身魔改，再混淆代码</td>
+          <td>几乎不可能离线复刻。<b>本项目 GD 音乐台是这种</b></td></tr>
+    </tbody>
+  </table>
+
+  <div class="box analogy">
+    <span class="lbl">类比「盐」</span>
+    <p>暗号里加一个<b>只有你和店家知道的词</b>。别人偷听到你报的暗号，也没法算出下一次该报什么——
+    因为他不知道那个词。</p>
+  </div>
+
+  <h3>签名通常长什么样</h3>
+  <p>在请求的查询串里，它会是一个看起来「格格不入」的参数：</p>
+  <pre><span class="c"># 其它参数都是人能读懂的，只有这个是乱码——它就是签名</span>
+?keyword=晴天&amp;page=1&amp;pagesize=3&amp;platform=WebFilter
+  &amp;clienttime=<span class="b">1789789360000</span>
+  &amp;<span class="k">signature=8F3A21C4D9E07B65A1F24C8D3E90B7A2</span></pre>
+
+  <p>找签名的第一步永远是：<b>看哪个参数像哈希</b>——32 位十六进制（MD5），或 8 位大写十六进制
+  （截断后的 MD5）。</p>
+</section>
+
+<!-- ============ 06 ============ -->
+<section id="sandbox">
+  <h2><span class="num">第 06 课</span>动手：亲手造一个签名</h2>
+
+  <p>下面是一个真实的签名算法（酷狗网页版，本项目的实测结论）。规则是：</p>
+
+  <pre><span class="k">签名</span> = MD5( 盐 + 参数按字母排序拼成 <span class="s">"k=v"</span> + 盐 ).toUpperCase()
+
+<span class="c"># 盐（一个固定的秘密串）</span>
+盐 = <span class="s">NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt</span></pre>
+
+  <p>改一改下面的输入，看签名怎么变。<b>这就是服务器能验证你的原因</b>——
+  它用同样的公式算一遍，对不上就拒绝。</p>
+
+  <div class="lab">
+    <p class="lab-title">实验：签名三明治生成器</p>
+    <p class="lab-sub">参数会先按名字排序，再拼成一条字符串，最后被「盐」夹在中间算 MD5。</p>
+
+    <div class="field"><label>keyword（歌名）</label><input id="f_keyword" value="晴天"></div>
+    <div class="field"><label>clientver（版本）</label><input id="f_clientver" value="2000"></div>
+    <div class="field"><label>platform（平台）</label><input id="f_platform" value="WebFilter"></div>
+    <div class="field"><label>mid（设备号）</label><input id="f_mid" value="8f3a21c4d9e07b65a1f24c8d3e90b7a2"></div>
+
+    <div class="out" id="sandbox_out"></div>
+    <p class="hint">把 <b>keyword</b> 里的「晴天」改成「睛天」（偏旁不同），看签名变成什么样。</p>
+  </div>
+
+  <div class="box remember">
+    <span class="lbl">从实验里应该看出来的三件事</span>
+    <p>1. <b>顺序是排序决定的</b>，不是你想怎么写就怎么写——差一个字符就全长错；<br>
+       2. <b>没有「盐」就算不出来</b>。盐藏在网页的 JavaScript 里，所以逆向的第一步往往是「找盐」；<br>
+       3. <b>结果是可重复的</b>。同样输入永远同样输出，这就是它能当门禁的原因。</p>
+  </div>
+</section>
+
+<!-- ============ 07 ============ -->
+<section id="case-a">
+  <h2><span class="num">第 07 课</span>实战：从零推出一个标准签名</h2>
+
+  <p>这一课用项目里真实发生过的一次排障当教材。它完美演示了「五步法」怎么用，
+  也演示了<b>一个错误假设会让你浪费多少时间</b>。</p>
+
+  <h3>现象</h3>
+  <p>我们要调酷狗的搜索接口。按照网上找到的开源实现，拼好参数、算好签名发过去，
+  服务器返回：</p>
+
+  <pre>{ <span class="s">"status"</span>: 1, <span class="s">"error_code"</span>: <span class="b">152</span>, <span class="s">"error_msg"</span>: <span class="s">"Parameter Error"</span> }</pre>
+
+  <p><b>Parameter Error</b>，参数错误。听起来像是我们某个参数写错了。</p>
+
+  <h3>第一个错误假设（也是大多数人的第一反应）</h3>
+  <p>「那就是参数写错了，我一个个试」——于是开始<b>参数消融</b>：把参数减到最少，
+  再一条条加回去，看错误码变不变。</p>
+
+  <pre><span class="c"># 只留最必要的</span>
+{keyword, page, pagesize}                     → <span class="b">152</span>
+{keyword, page, pagesize, platform}           → <span class="b">152</span>
+{…, iscorrection}                             → <span class="b">152</span>
+{…, area_code}                                → <span class="b">152</span>
+把全部参数都加上                                → <span class="b">152</span></pre>
+
+  <p>错误码纹丝不动。这说明：<b>问题不在业务参数上</b>。消融虽然没能解决问题，
+  但它干净地排除了一个方向——「排除法」也是实验的价值。</p>
+
+  <h3>关键的一步：换一个维度观察</h3>
+  <p>不要继续在参数上打转，而是问：<b>如果签名本身根本不对，会是什么表现？</b>
+  于是做了一组对照实验——把签名整个删掉：</p>
+
+  <pre>不带 signature 参数  → { <span class="s">"error_code"</span>: <span class="b">20006</span>, <span class="s">"error_msg"</span>: <span class="s">"err signature"</span> }
+带我们的签名        → { <span class="s">"error_code"</span>: <span class="b">152</span>, <span class="s">"error_msg"</span>: <span class="s">"Parameter Error"</span> }</pre>
+
+  <div class="box analogy">
+    <span class="lbl">这个对比告诉了我们什么</span>
+    <p>你有没有去过那种要盖章的门？<br>
+    · 不盖章 → 保安说「你没盖章」（<code>20006</code>）；<br>
+    · 盖了章 → 保安不吭声了，但另一个窗口说「表格填错」（<code>152</code>）。<br>
+    说明<b>章是真的被认了</b>——格式对了。问题出在别处。</p>
+  </div>
+
+  <p>于是把嫌疑范围收窄到两处：<b>要么是盐不对，要么是这套客户端参数（appid / clientver）不对。</b>
+  接着写一个矩阵脚本，一次跑完所有组合：</p>
+
+  <pre><span class="c"># 变体矩阵：一次跑完，不要一个个手试</span>
+appid=1005  clientver=20489  → <span class="b">152</span>
+appid=1005  clientver=11430  → <span class="b">152</span>
+appid=3116  clientver=11440  → <span class="b">20006 err signature</span>   <span class="c">← 换了盐之后，章又不认了</span>
+…（共 12 组，全都不通）</pre>
+
+  <h3>结论</h3>
+  <p><b>这套「安卓端」的签名方案已经整体失效了</b>——盐值轮换了，不是我们拼错了。
+  继续在这条路上折腾，无论怎么改参数都不会通。</p>
+
+  <p>于是横向去找<b>网页版</b>的那一套：换一个盐、换一套参数，一次就通了。</p>
+
+  <div class="box remember">
+    <span class="lbl">这一课真正要记住的</span>
+    <p><b>错误码是路标，不是噪音。</b><br>
+    · <code>20006 err signature</code> = 门口就没进来（没带签名 / 格式不对）；<br>
+    · <code>152 Parameter Error</code> = 进来了，但签名<b>值</b>不对或平台参数不对；<br>
+    · 看到 <code>152</code> 就去改业务参数，是方向性错误。</p>
+  </div>
+</section>
+
+<!-- ============ 08 ============ -->
+<section id="case-b">
+  <h2><span class="num">第 08 课</span>实战：签名读不懂怎么办</h2>
+
+  <p>上一课的签名是「标准 MD5 + 盐」，还能自己写出来。但本项目最主要的战场——GD 音乐台——
+  情况完全不同：</p>
+
+  <ul>
+    <li>签名函数叫 <code>crc32()</code>，但<b>它根本不是 CRC32，而是 MD5</b>；</li>
+    <li>而且这个 MD5 <b>被魔改过</b>：标准 MD5 里 <code>md5("abc")</code> 的结果是
+        <code>900150983cd24fb0d6963f7d28e17f72</code>，它的结果是
+        <code>9ef90af686e68195b6f6d89b69d3c584</code>；</li>
+    <li>代码还用 <code>jsjiami.com.v7</code> 混淆过，变量名全是 <code>_0x4f2a</code> 这种。</li>
+  </ul>
+
+  <p>如果你打算「读懂它、然后自己实现一遍」，这条路基本是死的。所以换思路。</p>
+
+  <h3>核心思想：打不过就借</h3>
+  <div class="box analogy">
+    <span class="lbl">类比</span>
+    <p>对方说的话你听不懂，还有方言口音。你不需要<b>学会</b>他的方言，
+    你只需要<b>把他本人请来当翻译</b>——他张嘴，你记录。</p>
+  </div>
+
+  <p>这段混淆的代码本身就是<b>可执行的 JavaScript</b>。那我们为什么不直接让它跑起来，
+  然后调用它自己的函数呢？Node.js 里有个 <code>vm</code> 模块，可以创建一个隔离的
+  JavaScript 运行环境。把这段代码丢进去，它的函数就归我们用了。</p>
+
+  <h3>技巧 A：把混淆文件丢进虚拟机</h3>
+  <pre><span class="k">const</span> vm = <span class="k">require</span>(<span class="s">"vm"</span>);
+
+<span class="c">// 1. 给这段代码准备一个「像浏览器」的环境（shim = 垫片）</span>
+<span class="k">const</span> ctx = {
+  location: { hostname: <span class="s">"music.gdstudio.xyz"</span> },   <span class="c">// 它要读域名</span>
+  mkPlayer: { version: <span class="s">"2026.09.16"</span> },          <span class="c">// 它要读站点版本号</span>
+  XMLHttpRequest: <span class="k">class</span> {                          <span class="c">// 它要发请求去拿服务器时间</span>
+    open(){} setRequestHeader(){}
+    send(){ setTimeout(<span class="k">() =></span> {
+      <span class="k">this</span>.readyState = 4;
+      <span class="k">this</span>.status = 200;
+      <span class="k">this</span>.responseText = String(Math.floor(Date.now()/<span class="b">1000</span>));
+      <span class="k">this</span>.onreadystatechange &amp;&amp; <span class="k">this</span>.onreadystatechange();
+    }, 0); }
+  },
+};
+ctx.window = ctx; ctx.globalThis = ctx;
+
+<span class="c">// 2. 让它跑起来</span>
+vm.createContext(ctx);
+vm.runInContext(混淆代码, ctx);
+
+<span class="c">// 3. 直接调用它自己的签名函数</span>
+<span class="k">const</span> 签名 = ctx.crc32(<span class="s">"Resonance"</span>);</pre>
+
+  <p>注意三件事：<b>我们没有理解它的算法，但拿到了正确的结果</b>；
+  「垫片」的作用是补上浏览器环境里它依赖的东西；
+  而且它依赖什么，我们是通过报错一点点试出来的——这本身就是实验。</p>
+
+  <h3>技巧 B：把混淆的字符串表解开</h3>
+  <p>混淆代码里，所有字符串都被藏起来了，用 <code>_0x2783(索引, 密钥)</code> 这样的函数取用。
+  但<b>这个解码函数是定义在顶层的</b>——代码一跑，它就成了全局函数。
+  于是可以把它抓出来，把整张字符串表翻译成明文：</p>
+
+  <pre><span class="c">// 正则找出代码里所有 (0x1c8, '0Bf6') 形式的调用点</span>
+<span class="k">const</span> 调用点 = [...混淆代码.<span class="k">matchAll</span>(<span class="s">/\((0x[0-9a-f]+),\s*'([^']+)'\)/g</span>)];
+
+<span class="c">// 逐个调用它的解码函数</span>
+<span class="k">const</span> 明文 = <span class="k">new</span> Set(调用点.<span class="k">map</span>(([, i, k]) => ctx._0x2783(i, k)));
+<span class="c">// 466 个调用点 → 去重后还原出 285 条明文</span></pre>
+
+  <h3>技巧 C：把全局函数包一层，看它被谁调用</h3>
+  <p>这是三个技巧里最有用的一个。<b>不动它的代码，只是把它的函数包一层</b>，
+  顺手把参数记录下来：</p>
+
+  <pre><span class="k">const</span> 记录 = [];
+<span class="k">const</span> 原函数 = ctx.md5;
+ctx.md5 = <span class="k">function</span> () {
+  记录.<span class="k">push</span>([...arguments]);      <span class="c">// 谁调用了我？参数是什么？</span>
+  <span class="k">return</span> 原函数.<span class="k">apply</span>(<span class="k">this</span>, arguments);
+};
+
+ctx.crc32(<span class="s">"Resonance"</span>);
+console.log(记录);
+<span class="c">// → [ "178978936|music.gdstudio.xyz|20260916|Resonance" ]</span></pre>
+
+  <p>一句话就把签名公式钉死了：</p>
+  <pre>签名 = MD5( <span class="b">时间戳前9位</span> | <span class="b">域名</span> | <span class="b">站点版本号</span> | <span class="b">入参</span> ).slice(-8).toUpperCase()</pre>
+
+  <div class="box remember">
+    <span class="lbl">这一课要记住的</span>
+    <p>读不懂代码时，<b>不要硬读，让它跑给你看</b>。三种姿势：<br>
+    <b>A</b> 造个环境让它运行 → 直接用它的函数；<br>
+    <b>B</b> 找它的解码器 → 把隐藏的字符串翻译出来；<br>
+    <b>C</b> 包一层它的函数 → 看它被谁用什么参数调用。<br>
+    C 的价值在于：得到的是<b>运行时的事实</b>，不是你的猜测。</p>
+  </div>
+
+  <h3>顺带得到的工程结论</h3>
+  <p>知道了公式，还有一个问题：<b>站点升级后公式会变</b>。所以最终的方案不是把公式写死，
+  而是<b>每次运行时现场去下载它的 <code>crc32.min.js</code>，装进虚拟机算签名</b>。
+  这样站点怎么改，我们都跟着走——这就是本项目 <code>gd-signer.js</code> 的全部内容。</p>
+</section>
+
+<!-- ============ 09 ============ -->
+<section id="identity">
+  <h2><span class="num">第 09 课</span>当它看的不是签名，而是「你是谁」</h2>
+
+  <p>签名算对了，请求也可能照样被拒。因为服务器还有别的判断维度：</p>
+
+  <table>
+    <thead><tr><th style="width:24%">机制</th><th style="width:38%">它在看什么</th><th>打法</th></tr></thead>
+    <tbody>
+      <tr><td><b>Cloudflare</b> 等防护</td>
+          <td>你的 TLS 握手指纹、IP、浏览器行为。给你发一个「挑战页」，通关后才发通行证</td>
+          <td>必须用<b>真实浏览器</b>跑完挑战</td></tr>
+      <tr><td><b>设备指纹</b></td>
+          <td>设备号、MAC、屏幕参数等。用来识别「是不是同一台机器」</td>
+          <td>把身份参数<b>固定下来</b>并持久化复用</td></tr>
+      <tr><td><b>人机验证</b>（风控）</td>
+          <td>访问频率、行为轨迹（鼠标轨迹、滚动）。异常就要求验证码</td>
+          <td>降低频率；或模拟真实行为</td></tr>
+    </tbody>
+  </table>
+
+  <h3>一个反直觉的发现</h3>
+  <p>很多教程会教你：「把浏览器的 <code>cf_clearance</code> cookie 抠出来，喂给 curl 就能过。」
+  我们实测的结果是：<b>不行，照样 403</b>。原因是这张通行证<b>和你的 IP、你的 TLS 指纹绑在一起</b>，
+  换一个程序去用，等于换了一个人拿着别人的通行证进门，一眼就识破。</p>
+
+  <pre>从浏览器抠出 cookie 给 curl          → <span class="b">403</span>  <span class="c">（绑 IP + TLS 指纹）</span>
+用 Node 的 fetch 直接请求              → 被拦  <span class="c">（TLS 指纹不像浏览器）</span>
+改用系统自带的 curl                    → <span class="s">通过</span>  <span class="c">（网络栈更「像正常客户端」）</span>
+真无头浏览器 --headless=new            → <span class="s">通过</span>  <span class="c">（2026-09 实测）</span></pre>
+
+  <p>所以本项目的下载器里有一句看起来很怪的注释：<b>HTTP 一律走系统 curl，不要用 Node 内置的 fetch</b>。
+  这不是玄学，是因为两者的网络实现不同，指纹也不同。</p>
+
+  <div class="box analogy">
+    <span class="lbl">类比</span>
+    <p>就像门卫不只是看你的证件，还看你的身高、口音、走路姿势。
+    你借了别人的证，但姿势不对，照样被拦。所以正解不是「搞到一张证」，
+    而是<b>换一个门卫认得的身份进去</b>。</p>
+  </div>
+
+  <h3>浏览器窗口的坑（一次真实的翻案）</h3>
+  <p>用真浏览器就得开窗口，会弹出来打扰人。我们试过的三种「藏窗口」方法：</p>
+  <table>
+    <thead><tr><th style="width:40%">方法</th><th>结果</th></tr></thead>
+    <tbody>
+      <tr><td>把窗口移到屏幕外 <code>--window-position=-4000,-4000</code></td>
+          <td>失败。Chrome 会<b>自动把窗口拉回可见区域</b>，一直弹窗</td></tr>
+      <tr><td>以「隐藏状态」启动 App</td><td>可用，作为备选</td></tr>
+      <tr><td><code>--headless=new</code> 真无头</td><td>可用，而且<b>比有头模式快得多</b></td></tr>
+    </tbody>
+  </table>
+  <p>这段经历也印证了五步法：<b>一个假设被推翻（离屏可行）不代表失败</b>，
+  它把选项从三个收敛到一个。</p>
+</section>
+
+<!-- ============ 10 ============ -->
+<section id="errors">
+  <h2><span class="num">第 10 课</span>错误码是路标</h2>
+
+  <p>逆向过程中你会收到大量错误。新手把它们当噪音、一个个乱试；
+  <b>老手把错误码当地图</b>，因为它直接告诉你「卡在哪一层」。</p>
+
+  <table>
+    <thead><tr><th style="width:36%">返回</th><th style="width:28%">含义</th><th>下一步该做什么</th></tr></thead>
+    <tbody>
+      <tr><td><code>20006 err signature</code></td>
+          <td>没带签名，或格式不对</td><td>检查是否漏传了签名字段</td></tr>
+      <tr><td><code>152 Parameter Error</code></td>
+          <td>签名<b>值</b>不对，或平台参数不对</td><td>换盐值、换端（网页/安卓）</td></tr>
+      <tr><td><code>30020</code> + <code>SSA-CODE</code> 响应头</td>
+          <td>签名全对，撞上风控</td><td>降低频率；或放弃这条路线</td></tr>
+      <tr><td><code>-32001 Session not found</code></td>
+          <td>会话过期（不是限流）</td><td>重新建立会话后重试</td></tr>
+      <tr><td><code>status: 0</code> 但 HTTP 200</td>
+          <td>请求成功、业务拒绝</td><td>读 <code>msg</code> 字段，通常是权限或资源不存在</td></tr>
+    </tbody>
+  </table>
+
+  <div class="box remember">
+    <span class="lbl">一个反复出现的陷阱</span>
+    <p><b>别只看 HTTP 状态码。</b>上面有个例子：<code>-32001</code> 会话过期时，
+    服务器返回的<b>不是 200</b>。如果你只判断 <code>status === 200</code>，就会漏掉整类错误，
+    表现为「莫名其妙什么都不返回」。</p>
+  </div>
+
+  <div class="lab quiz" id="quiz">
+    <p class="lab-title">小测：你能看懂这几个错误吗</p>
+    <p class="lab-sub">点选你认为正确的答案。</p>
+  </div>
+</section>
+
+<!-- ============ 11 ============ -->
+<section id="pivot">
+  <h2><span class="num">第 11 课</span>别死磕：横向换端</h2>
+
+  <p>这是本项目最有价值的经验，没有之一。</p>
+
+  <div class="box analogy">
+    <span class="lbl">类比</span>
+    <p>你要进一栋楼，<b>正门锁了</b>。新手的做法是：「我一定要打开这扇门」——
+    研究锁芯、配钥匙，花三天。<br>
+    老手的做法是：<b>绕楼走一圈</b>。结果发现有侧门、消防通道、还有一扇给送外卖的没锁。</p>
+  </div>
+
+  <p>同一个功能，服务商往往有<b>好几套接口</b>：给网页用的、给安卓 App 用的、
+  给旧版 App 用的、给小程序用的。它们的验证强度常常相差很大——
+  因为老接口是为了兼容旧版本客户端而保留的，往往<b>根本不验签名</b>。</p>
+
+  <p>本项目在酷狗上实测出来的对照表：</p>
+
+  <table>
+    <thead><tr><th style="width:44%">接口</th><th>结果</th></tr></thead>
+    <tbody>
+      <tr><td><code>gateway.kugou.com</code>（安卓端签名）</td>
+          <td>全部失败，恒返回 <code>152</code></td></tr>
+      <tr><td><code>complexsearch.kugou.com</code>（网页端签名）</td>
+          <td><b>可用</b></td></tr>
+      <tr><td><code>wwwapi.kugou.com/play/songinfo</code></td>
+          <td>失败，<code>30020</code> 风控</td></tr>
+      <tr><td><code>m.kugou.com/app/i/getSongInfo.php</code>（移动端老接口）</td>
+          <td><b>可用，而且完全不需要签名</b></td></tr>
+      <tr><td><code>lyrics.kugou.com/v1/search</code></td>
+          <td>失败，返回 0 字节空响应</td></tr>
+      <tr><td><code>krcs.kugou.com/search</code>（老接口）</td>
+          <td><b>可用，而且完全不需要签名</b></td></tr>
+    </tbody>
+  </table>
+
+  <p>结论很清楚：<b>通过的那两条，都是移动端的老域名，都不用签名。</b>
+  与其花三天破签名，不如花十分钟把候选端点列出来批量探一遍。</p>
+
+  <div class="box remember">
+    <span class="lbl">怎么做才不累</span>
+    <p>不要「试一个、改一次、再试一个」。写一个<b>矩阵脚本</b>，把所有组合一次跑完，
+    输出只打三样东西：<b>状态码、命中条数、第一条结果的标题</b>。一眼就能看出哪一格是绿的。</p>
+  </div>
+
+  <pre><span class="c"># 变体矩阵的思路：把「猜测」变成「一次实验」</span>
+<span class="k">for</span> 端点 <span class="k">of</span> [正门, 侧门, 后门, 老门] {
+  <span class="k">for</span> 身份参数 <span class="k">of</span> [dfid 的 4 种写法] {
+    <span class="k">for</span> 版本组合 <span class="k">of</span> [appid × clientver 的 12 组] {
+      打印(状态码, 命中条数, 首条标题)
+    }
+  }
+}</pre>
+
+  <h3>还有一个「反向」的技巧</h3>
+  <p>找不到参数该填什么时，去看<b>别人的开源实现</b>。本项目用的就是这条路：
+  先找到已有的开源项目（酷狗那边是 <code>KuGouMusicApi</code>），
+  其中盐值、签名、参数全是明文写在 JavaScript 里的。</p>
+  <div class="box remember">
+    <span class="lbl">记住</span>
+    <p><b>先搜有没有现成的，再决定要不要自己逆。</b>别人已经逆向过的东西，
+    你没有义务再逆向一遍。这也是搜索能力属于逆向能力的一部分的原因。</p>
+  </div>
+</section>
+
+<!-- ============ 12 ============ -->
+<section id="evidence">
+  <h2><span class="num">第 12 课</span>证据分级：做一个诚实的逆向者</h2>
+
+  <p>这一课讲的是「怎么把结论写下来」。它看起来像文科要求，实际上是工程要求——
+  因为<b>三个月后的你，会忘记当时是怎么得出结论的</b>。</p>
+
+  <p>任何一条结论，都必须标注它是哪一级：</p>
+
+  <div class="kv">
+    <div class="c"><p class="t">observed · 观测</p><p class="v">我亲手跑出来过</p></div>
+    <div class="c"><p class="t">inferred · 推断</p><p class="v">我从别的现象推出来的</p></div>
+    <div class="c"><p class="t">unknown · 未覆盖</p><p class="v">我没测过，不知道</p></div>
+  </div>
+
+  <table>
+    <thead><tr><th style="width:50%">不诚实的写法</th><th>诚实的写法</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>「这个接口支持无损。」</td>
+        <td>「<b>实测</b>：免费曲目（搜索结果里权限字段为 0）可下到真无损，
+            实测某首歌 32.8MB / 1061kbps，文件头魔数为 <code>664c6143</code>；
+            <b>VIP 曲目未覆盖</b>，因为没做登录态。」</td>
+      </tr>
+      <tr>
+        <td>「签名算法是 MD5。」</td>
+        <td>「签名<b>看起来</b>是 MD5 结构（32 位十六进制），但<b>实测</b>它对
+            <code>"abc"</code> 算出的值与标准 MD5 不同，说明内核被改过
+            （推断：可能是换了常量或做了额外变换）。」</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>为什么要这么较真</h3>
+  <ul>
+    <li><b>边界比结论更重要。</b>「能下无损」+「仅限免费曲目」才是完整信息。
+        只说前半句，下次别人拿 VIP 歌去试，会被你坑一整天。</li>
+    <li><b>脚本注释就是给人看的说明书。</b>本项目每个下载脚本的头部都写着
+        「逆向来源」和「失效条件」，就是为了让接手的人知道<b>它什么时候会坏</b>。</li>
+    <li><b>失效是常态，不是意外。</b>站点会升级、盐会轮换。标了日期的结论，
+        失效时你只需要重新验证，不需要从零再来。</li>
+  </ul>
+
+  <h3>回写的标准模板</h3>
+  <pre><span class="c">## 某接口可用性（YYYY-MM-DD 实测）</span>
+
+| 端点 | 签名 | 结果 |
+|---|---|---|
+| a.example.com/xxx | 无 | ✅ 可用 |
+| b.example.com/xxx | MD5+盐 | ❌ 恒 152 |
+
+<span class="c">- 实测证据：</span>（贴命令与返回，注明是否复现过）
+<span class="c">- 能力边界：</span>（只在什么条件下有效、什么情况没测）
+<span class="c">- 失效条件：</span>（盐值轮换 / 端点下线 / 需登录）</pre>
+</section>
+
+<!-- ============ 13 ============ -->
+<section id="checklist">
+  <h2><span class="num">第 13 课</span>项目体检表：回到实战</h2>
+
+  <p>把前面 12 课串起来，这就是本项目的全貌——<b>四个目标，四个防护等级，四条打法</b>。</p>
+
+  <table>
+    <thead><tr><th style="width:16%">目标</th><th style="width:18%">防护等级</th><th style="width:26%">关键结论</th><th>打法</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>ChKSz</b></td><td>L0 无防护</td>
+        <td>正规接口，凭 apikey 调用</td><td>不需要逆向，直接照文档调</td>
+      </tr>
+      <tr>
+        <td><b>酷狗</b></td><td>L1 静态签名</td>
+        <td>网页盐 = 标准 MD5 三明治；移动端老接口免签名</td>
+        <td>离线复刻签名；<b>优先走免签名的老接口</b></td>
+      </tr>
+      <tr>
+        <td><b>Embeat</b></td><td>L2 混淆签名</td>
+        <td>与 GD 共用同一个签名器</td>
+        <td>复用 <code>gd-signer.js</code></td>
+      </tr>
+      <tr>
+        <td><b>GD 音乐台</b></td><td>L2 + L4</td>
+        <td>签名是魔改 MD5（不可复刻）；站点置于 Cloudflare 之后</td>
+        <td>借鸡生蛋（Node 虚拟机跑它的 JS）+ 真无头浏览器过盾</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>GD 的完整取流过程</h3>
+  <p>把第 08 课和第 09 课接起来，一次成功的取流是这样的：</p>
+
+  <div class="flow">
+    <svg viewBox="0 0 680 168" role="img" xmlns="http://www.w3.org/2000/svg">
+      <title>GD 音乐台一次取流的完整过程</title>
+      <desc>启动不可见浏览器通过防护，在页面内用站点自己的签名函数签名，调用接口拿到 CDN 直链，再由 Node 直连下载并校验。</desc>
+      <defs>
+        <marker id="arrow2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="#2E6B55" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </marker>
+      </defs>
+      <rect x="40" y="40" width="132" height="56" rx="10" fill="#E4EDE6" stroke="#2E6B55" stroke-width="0.5"/>
+      <text x="106" y="61" text-anchor="middle" fill="#1F4A3C" font-size="13" font-weight="500" font-family="sans-serif" dominant-baseline="central">① 不可见浏览器</text>
+      <text x="106" y="79" text-anchor="middle" fill="#2E6B55" font-size="12" font-family="sans-serif" dominant-baseline="central">无头 / 隐藏</text>
+      <path d="M174 68 L194 68" fill="none" stroke="#2E6B55" stroke-width="1.5" marker-end="url(#arrow2)"/>
+      <rect x="196" y="40" width="132" height="56" rx="10" fill="#E4EDE6" stroke="#2E6B55" stroke-width="0.5"/>
+      <text x="262" y="61" text-anchor="middle" fill="#1F4A3C" font-size="13" font-weight="500" font-family="sans-serif" dominant-baseline="central">② 通过防护</text>
+      <text x="262" y="79" text-anchor="middle" fill="#2E6B55" font-size="12" font-family="sans-serif" dominant-baseline="central">拿到通行证</text>
+      <path d="M330 68 L350 68" fill="none" stroke="#2E6B55" stroke-width="1.5" marker-end="url(#arrow2)"/>
+      <rect x="352" y="40" width="132" height="56" rx="10" fill="#E4EDE6" stroke="#2E6B55" stroke-width="0.5"/>
+      <text x="418" y="61" text-anchor="middle" fill="#1F4A3C" font-size="13" font-weight="500" font-family="sans-serif" dominant-baseline="central">③ 页面内签名</text>
+      <text x="418" y="79" text-anchor="middle" fill="#2E6B55" font-size="12" font-family="sans-serif" dominant-baseline="central">调站点函数</text>
+      <path d="M486 68 L506 68" fill="none" stroke="#2E6B55" stroke-width="1.5" marker-end="url(#arrow2)"/>
+      <rect x="508" y="40" width="132" height="56" rx="10" fill="#FAEEDF" stroke="#C9701F" stroke-width="0.5"/>
+      <text x="574" y="61" text-anchor="middle" fill="#8A4A12" font-size="13" font-weight="500" font-family="sans-serif" dominant-baseline="central">④ 拿到直链</text>
+      <text x="574" y="79" text-anchor="middle" fill="#C9701F" font-size="12" font-family="sans-serif" dominant-baseline="central">CDN 地址</text>
+      <rect x="40" y="112" width="600" height="40" rx="10" fill="var(--color-background-secondary)" stroke="#E3DED2" stroke-width="0.5"/>
+      <text x="340" y="132" text-anchor="middle" fill="#5C5A52" font-size="12.5" font-family="sans-serif" dominant-baseline="central">音频 CDN 不在防护之内 → Node / curl 直接下载 → 用文件头魔数校验是不是真无损</text>
+    </svg>
+  </div>
+
+  <h3>还有一个「不要相信它说的话」的例子</h3>
+  <p>接口返回的参数里有个 <code>br</code>（比特率），意思是「这首歌的音质」。听起来可以直接信，
+  但实测发现它<b>经常虚标</b>：</p>
+
+  <table>
+    <thead><tr><th style="width:22%">音源</th><th style="width:26%">自称 br</th><th style="width:26%">实际码率</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td>qobuz</td><td>999</td><td><b>1411</b></td><td>真有 24bit 无损</td></tr>
+      <tr><td>netease</td><td>636</td><td>639</td><td>基本属实</td></tr>
+      <tr><td>joox</td><td>999</td><td><b>630</b></td><td><b>严重虚标</b></td></tr>
+      <tr><td>apple</td><td>256</td><td>283</td><td>属实</td></tr>
+    </tbody>
+  </table>
+
+  <p>所以真正可靠的判断方式是：<b>用文件大小 ÷ 时长反推实际码率</b>，而不是相信它自称的数字。
+  这就是本项目的选源机制——把每个音源都扫一遍，按实际品质排序，再挑最好的那个下载。</p>
+
+  <div class="box remember">
+    <span class="lbl">记住</span>
+    <p>逆向的终点不是「能跑」，而是<b>「知道自己拿到的是什么」</b>。下载完成后用系统
+    <code>afinfo</code> 实测采样率 / 位深 / 码率，就是在给结论补上 observed 级的证据。</p>
+  </div>
+</section>
+
+<!-- ============ 14 ============ -->
+<section id="pitfalls">
+  <h2><span class="num">第 14 课</span>踩坑集：我走过的弯路</h2>
+
+  <p>这一节全部是<b>真实的错误</b>。看别人踩坑是最省学费的学习方式。</p>
+
+  <h3>坑 1 · 把错误码当噪音</h3>
+  <p>看到 <code>152 Parameter Error</code>，真的以为是自己参数拼错了，开始逐个试参数。
+  浪费了一整轮。真相是<b>签名盐值已经轮换</b>，跟参数毫无关系。</p>
+  <p><b>教训</b>：先读错误码的语义，再动手。花两分钟理解 <code>20006 / 152 / 30020</code> 的区别，
+  能省一整晚。</p>
+
+  <h3>坑 2 · 在一个维度上死磕</h3>
+  <p>安卓端这条路已经死了，还在换 <code>appid</code>、换 <code>clientver</code>、换设备号——
+  一共试了 12 组以上，全是 152。而正确答案是<b>换到网页端</b>，一次就通。</p>
+  <p><b>教训</b>：连续三次同类型失败，就应该换维度，而不是换数值。</p>
+
+  <h3>坑 3 · 拿「看起来相关」的东西当原因</h3>
+  <p>搜索失败时，曾经以为是「被限流了」。后来发现真正原因是
+  <b>曲名里带了半角括号或撇号</b>——这类字符在参数编码时不会被转义，导致服务端算出的签名
+  和本地不一致。换成纯 ASCII 标题立刻正常。</p>
+  <p><b>教训</b>：「限流」是最容易被滥用的解释。用<b>对照实验</b>验证：
+  同一时刻换一个干净的输入，如果通了，就不是限流。</p>
+
+  <h3>坑 4 · 在没有必要的环境里硬撑</h3>
+  <p>为了验证一个接口，尝试在沙箱里 <code>npm install</code> 把整个服务端装起来，结果进程被杀。
+  而实际上<b>用纯 HTTP 请求就能验证</b>，压根不需要跑那个服务。</p>
+  <p><b>教训</b>：先问「验证这个结论，最少需要做什么」。能一条 <code>curl</code> 解决的，
+  别去装一整套环境。</p>
+
+  <h3>坑 5 · 把「同名」当成「同一首歌」</h3>
+  <p>歌词接口只按歌名检索，实测把《海阔天空》匹配到了一首<b>翻唱版</b>的歌词，
+  歌词第一行还带着「本歌曲翻唱由某某提供」的水印。</p>
+  <p><b>教训</b>：名字匹配永远不可靠。加上<b>时长校验</b>（差超过 6 秒就丢弃），
+  并且记牢一句话：<b>宁可没有，也不要错的</b>——错版本比没版本更糟。</p>
+
+  <h3>坑 6 · 忘了回写</h3>
+  <p>有些结论当时想明白了，没写下来，下次遇到同样的问题又debug了一遍。</p>
+  <p><b>教训</b>：结论不落文档，等于没做。这也是这门课第 03 课第五步存在的唯一理由。</p>
+</section>
+
+<!-- ============ 15 ============ -->
+<section id="glossary">
+  <h2><span class="num">附 录 A</span>术语对照表</h2>
+
+  <table>
+    <thead><tr><th style="width:24%">术语</th><th>人话解释</th></tr></thead>
+    <tbody>
+      <tr><td><b>端点 / Endpoint</b></td><td>一个具体的接口地址，比如 <code>/v2/search/song</code></td></tr>
+      <tr><td><b>参数 / Parameter</b></td><td>你要办的具体要求，跟在网址问号后面</td></tr>
+      <tr><td><b>请求头 / Header</b></td><td>随请求附带的身份信息，比如 <code>User-Agent</code></td></tr>
+      <tr><td><b>哈希 / Hash</b></td><td>把任意长度的内容压成一串固定长度、不可逆的字符</td></tr>
+      <tr><td><b>MD5</b></td><td>最常见的一种哈希算法，输出 32 位十六进制</td></tr>
+      <tr><td><b>盐 / Salt</b></td><td>混进哈希计算里的一个秘密字符串</td></tr>
+      <tr><td><b>签名 / Signature</b></td><td>用哈希算出来的「暗号」，证明请求合法</td></tr>
+      <tr><td><b>混淆 / Obfuscation</b></td><td>把代码改得人能读不懂，但机器照样能跑</td></tr>
+      <tr><td><b>垫片 / Shim</b></td><td>为了让一段代码跑起来，给它补上的假环境</td></tr>
+      <tr><td><b>虚拟机 / vm</b></td><td>一个隔离的代码运行环境，可以安全地跑别人的代码</td></tr>
+      <tr><td><b>指纹 / Fingerprint</b></td><td>能唯一标识「你是哪台设备 / 哪个程序」的特征组合</td></tr>
+      <tr><td><b>风控</b></td><td>服务端识别「这是不是机器在刷」并加以拦阻的机制</td></tr>
+      <tr><td><b>限流 / Rate limit</b></td><td>限制单位时间内的请求次数</td></tr>
+      <tr><td><b>CDN 直链</b></td><td>文件的真实存放地址，通常不带任何校验，拿到就能下</td></tr>
+      <tr><td><b>魔数 / Magic number</b></td><td>文件开头几个字节，用来判断真实格式。<code>fLaC</code> 表示 FLAC</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============ 16 ============ -->
+<section id="next">
+  <h2><span class="num">附 录 B</span>下一步怎么练</h2>
+
+  <p>看会了不等于会。按下面这个顺序练，两周就能独立干活。</p>
+
+  <h3>第 1 周 · 观察力</h3>
+  <ol>
+    <li>打开任意网站的开发者工具 <b>Network</b> 面板，随便点几下，把每个请求的
+        四要素（域名路径 / 参数 / 请求头 / 响应）念出来；</li>
+    <li>找一条 <b>GET</b> 请求，右键 Copy as cURL，粘到终端运行——
+        看你能不能复现浏览器看到的响应；</li>
+    <li>找一条带 <code>signature</code> 或 <code>token</code> 的请求，
+        试试<b>把它删掉</b>再发，看错误码怎么变。<b>这是最有信息量的一步</b>。</li>
+  </ol>
+
+  <h3>第 2 周 · 动手力</h3>
+  <ol>
+    <li>把本项目的 <code>kugou-downloader.js</code> 读一遍，对照本课第 06 课，
+        找到那个签名函数，验证它算出来的值和你手算的一样；</li>
+    <li>用 <code>--probe</code> 参数跑一次，看它打印的候选和档位，理解
+        「匹配分」是怎么打出来的；</li>
+    <li>读 <code>gd-signer.js</code>（只有 100 多行），对照第 08 课的技巧 A，
+        看清那三个 shim 各自解决什么问题。</li>
+  </ol>
+
+  <h3>第 3 周起 · 独立思考</h3>
+  <p>挑一个你日常用的网站或 App，给自己出题：<br>
+  「它搜索的时候发了什么请求？」→「有没有签名？」→「签名怎么算的？」→
+  「能不能自己写个脚本复现？」</p>
+  <p><b>不要一上来就挑最难的</b>。先从没有签名的公开接口练手，
+  建立起「我能看懂并复现」的信心，再逐级往上爬。</p>
+
+  <div class="box remember">
+    <span class="lbl">最后的建议</span>
+    <p>逆向工程真正难的不是技术，是<b>纪律</b>：<br>
+    先观察再假设、一次只改一个变量、连续失败就换维度、
+    结论必须分级并写下来、动手之前先想清楚边界。<br>
+    这五条做到了，你比 90% 只会复制粘贴脚本的人走得远得多。</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <p>逆向工程入门 · 零基础版 &nbsp;|&nbsp; 案例来自 <b>自动下载音乐</b> 项目的真实排障记录</p>
+  <p>配套文档：<code>逆向工程方法论-2026-10.md</code> · <code>ECHOMUSIC_REFERENCE.md</code> ·
+     <code>GDSTUDIO_REFERENCE.md</code></p>
+  <p>本页仅供技术学习。请遵守当地法律与平台条款，勿用于侵权、绕过付费或影响他人服务。</p>
+</footer>
+
+</div>
+
+<script>
+/* ============================================================
+   MD5（标准实现，用于签名实验；已用标准测试向量验证）
+   ============================================================ */
+const MD5_K = new Int32Array([
+  0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+  0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+  0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+  0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+  0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+  0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+  0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+  0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391
+]);
+const MD5_S = [7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+               5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+               4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+               6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
+
+function md5(str) {
+  const bytes = new TextEncoder().encode(str);
+  const len = bytes.length, bitLen = len * 8;
+  const total = (((len + 8) >> 6) + 1) * 64;
+  const buf = new Uint8Array(total);
+  buf.set(bytes);
+  buf[len] = 0x80;
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(total - 8, bitLen >>> 0, true);
+  dv.setUint32(total - 4, Math.floor(bitLen / 4294967296), true);
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  const M = new Int32Array(16);
+  for (let off = 0; off < total; off += 64) {
+    for (let i = 0; i < 16; i++) M[i] = dv.getInt32(off + i * 4, true);
+    let A = a0, B = b0, C = c0, D = d0;
+    for (let i = 0; i < 64; i++) {
+      let F, g;
+      if (i < 16) { F = (B & C) | (~B & D); g = i; }
+      else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) % 16; }
+      else if (i < 48) { F = B ^ C ^ D; g = (3 * i + 5) % 16; }
+      else { F = C ^ (B | ~D); g = (7 * i) % 16; }
+      F = (F + A + MD5_K[i] + M[g]) | 0;
+      A = D; D = C; C = B;
+      B = (B + ((F << MD5_S[i]) | (F >>> (32 - MD5_S[i])))) | 0;
+    }
+    a0 = (a0 + A) | 0; b0 = (b0 + B) | 0; c0 = (c0 + C) | 0; d0 = (d0 + D) | 0;
+  }
+  const out = new Uint8Array(16);
+  const odv = new DataView(out.buffer);
+  odv.setInt32(0, a0, true); odv.setInt32(4, b0, true);
+  odv.setInt32(8, c0, true); odv.setInt32(12, d0, true);
+  return [...out].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+/* ============================================================
+   实验：签名三明治
+   ============================================================ */
+const SALT = "NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt";
+
+function renderSandbox() {
+  const kw = document.getElementById("f_keyword").value;
+  const cv = document.getElementById("f_clientver").value;
+  const pf = document.getElementById("f_platform").value;
+  const mid = document.getElementById("f_mid").value;
+
+  const params = {
+    appid: 1014,
+    clienttime: 1789789360000,
+    clientver: cv,
+    dfid: "-",
+    keyword: kw,
+    mid: mid,
+    page: 1,
+    pagesize: 10,
+    platform: pf,
+    srcappid: 2919,
+    userid: 0
+  };
+  const sortedKeys = Object.keys(params).sort();
+  const joined = sortedKeys.map(k => k + "=" + params[k]).join("");
+  const sandwich = SALT + joined + SALT;
+  const signature = md5(sandwich).toUpperCase();
+  const withoutSalt = md5(joined);
+
+  const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  document.getElementById("sandbox_out").innerHTML =
+    '<div class="row"><span class="tag">① 排序后的参数</span><span class="val">' + esc(sortedKeys.join(" , ")) + "</span></div>" +
+    '<div class="row"><span class="tag">② 拼成一条串</span><span class="val">' + esc(joined) + "</span></div>" +
+    '<div class="row"><span class="tag">③ 夹上盐</span><span class="val">盐 + ↑ + 盐</span></div>' +
+    '<div class="row"><span class="tag">④ 最终签名</span><span class="val ok">' + signature + "</span></div>" +
+    '<div class="row"><span class="tag">对照：不加盐</span><span class="val">' + withoutSalt + "</span></div>";
+}
+
+["f_keyword", "f_clientver", "f_platform", "f_mid"].forEach(function (id) {
+  document.getElementById(id).addEventListener("input", renderSandbox);
+});
+renderSandbox();
+
+/* ============================================================
+   小测
+   ============================================================ */
+const QUESTIONS = [
+  {
+    q: "服务器返回 <code>20006 err signature</code>，最可能的原因是？",
+    opts: ["签名的值算错了", "请求里根本没带签名字段，或格式不对", "访问太频繁被限流了"],
+    right: 1,
+    exp: "20006 表示「签名这一关就没过」——通常是漏传了签名字段。如果带了但值错，会返回 152。注意 20006 这个码在酷狗的另一个老接口里也见过，含义同样是「签名不被接受」。"
+  },
+  {
+    q: "返回 <code>152 Parameter Error</code>，你的第一反应应该是？",
+    opts: ["逐项检查业务参数哪个写错了", "怀疑签名值或平台参数整体不对（比如盐值轮换了）", "降低请求频率再试"],
+    right: 1,
+    exp: "这正是本项目踩过的坑。152 时签名「格式」已经被接受，问题在值或平台参数上。先做端点/盐值横向对比，再考虑业务参数——顺序反了会浪费一整轮。"
+  },
+  {
+    q: "某接口返回 <code>30020</code> 并带一个 <code>SSA-CODE</code> 响应头，这意味着？",
+    opts: ["签名算法写错了，需要重新逆", "签名是对的，但触发了风控（人机验证）", "这个接口已经下线了"],
+    right: 1,
+    exp: "30020 + SSA-CODE 说明签名校验已经通过，卡在风控层。此时继续改签名没有任何意义——要么降低频率、要么走别的端点、要么放弃这条路线。"
+  },
+  {
+    q: "同一个「取歌」功能，A 接口要签名且总是失败，你应该先做什么？",
+    opts: ["花时间把 A 接口的签名彻底逆向出来", "把其它候选端点（网页端/移动端老接口）列出来批量探一遍", "把请求频率调低再试 A"],
+    right: 1,
+    exp: "本项目的核心经验：移动端老域名常常免签名。先横向换端，成本极低；纵向硬啃签名，成本极高。矩阵脚本一次跑完是最省事的做法。"
+  }
+];
+
+(function renderQuiz() {
+  const host = document.getElementById("quiz");
+  QUESTIONS.forEach(function (item, qi) {
+    const wrap = document.createElement("div");
+    wrap.className = "q";
+    const qt = document.createElement("div");
+    qt.className = "qt";
+    qt.innerHTML = (qi + 1) + ". " + item.q;
+    wrap.appendChild(qt);
+    item.opts.forEach(function (text, oi) {
+      const btn = document.createElement("div");
+      btn.className = "opt";
+      btn.textContent = text;
+      btn.addEventListener("click", function () {
+        if (wrap.dataset.done) return;
+        wrap.dataset.done = "1";
+        const siblings = wrap.querySelectorAll(".opt");
+        btn.classList.add(oi === item.right ? "right" : "wrong");
+        if (oi !== item.right) siblings[item.right].classList.add("right");
+        if (oi !== item.right) btn.classList.add("wrong");
+        wrap.querySelector(".exp").classList.add("show");
+      });
+      wrap.appendChild(btn);
+    });
+    const exp = document.createElement("div");
+    exp.className = "exp";
+    exp.innerHTML = "<b>解析：</b>" + item.exp;
+    wrap.appendChild(exp);
+    host.appendChild(wrap);
+  });
+})();
+
+/* ============================================================
+   目录高亮
+   ============================================================ */
+(function tocSpy() {
+  const links = [...document.querySelectorAll("aside a")];
+  const map = new Map();
+  links.forEach(function (a) {
+    const id = a.getAttribute("href").slice(1);
+    const el = document.getElementById(id);
+    if (el) map.set(el, a);
+  });
+  const obs = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) {
+        links.forEach(function (l) { l.classList.remove("on"); });
+        const a = map.get(e.target);
+        if (a) a.classList.add("on");
+      }
+    });
+  }, { rootMargin: "-15% 0px -70% 0px", threshold: 0 });
+  map.forEach(function (_a, el) { obs.observe(el); });
+})();
+</script>
+</body>
+</html>
