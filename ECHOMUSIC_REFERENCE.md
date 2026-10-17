@@ -199,3 +199,65 @@ srcappid=2919 / appid=1014 / iscorrection=1 / privilege_filter=0 / userid=0 / to
 - **不引入**生成 `sid/edt` 的行为指纹模拟（`generate_simulate.js` 那套）——那是登录/风控路径的专用武器，
   我们走免签名端点不需要它，也就没有相应的法律与维护成本。
 
+---
+
+# 补充（2026-10-17）：反向接入——把 GD 音乐台做成 EchoMusic 的音源插件
+
+> 与前面几节方向相反：不是「从 EchoMusic 学下载」，而是**把 GD 音乐台塞进 EchoMusic 当第二音源**，
+> 解决 EchoMusic 只有酷狗一家、VIP/无版权曲目「无法播放」的问题。
+> 成品：仓库根目录 `echomusic-plugin-gdstudio/`（manifest + index.js + README）。
+
+## 12. EchoMusic 插件系统（官方文档在 `hoowhoami/EchoMusicPlugins`）
+
+- 插件 = 一个目录（`manifest.json` + 入口 ESM `index.js`），放进
+  `~/Library/Application Support/echo-music/plugins/`，在「插件管理」里启用。
+- 关键能力：`capabilities.audioSource`（音源）、`.unrestrictedNetwork`（主进程 Axios，可改 UA/Referer）。
+- **音源挂载点**（`ctx.player.audioSource.register`）：
+
+  ```text
+  before-catalog → catalog（内置酷狗 song/url）→ after-catalog → cloud → final-fallback
+  ```
+
+  `after-catalog` **正是「酷狗解析失败后」**——VIP/无版权曲目就落在这里，是兜底接入的最佳位置。
+  `position` 只约束 `resolve`；`transform` 用 `transformStages` 单独声明，且可返回 `false` 拒绝候选。
+- 注册项返回的清理函数要保存，禁用/改配置时调用，否则重复注册会叠加。
+- 网络：`ctx.net.fetch` 是浏览器 fetch（受 CORS，`api.php` 无 CORS 头 → 必挂）；
+  必须用 `ctx.net.request`（主进程 Axios / Node HTTP，返回 `{status, headers, data}`）。
+
+## 13. 三条实测结论（2026-10-17，Intel Mac + 系统代理 127.0.0.1:51279）
+
+| 通道 | 结果 |
+|---|---|
+| `music.gdstudio.org/api.php`（签名） | ✅ **直连可用**（Node fetch / 主进程 Axios 都行），`/time` 200，`tencent/kuwo/netease/tidal/apple/ytmusic/bilibili` 均能搜+取流 |
+| `music.gdstudio.xyz/api.php` | ❌ 本机超时（此前「xyz 直连可用」的结论按网络环境而异，需现场复测）→ 插件把它做成可切换的备用站 |
+| `music-api.gdstudio.xyz/api.php`（免签名 mirror） | ✅ 可用但**只有 netease / joox**；`joox` 搜得到《晴天》却取流为空 |
+
+**音源可用性（org 站点）**：`migu / kugou / spotify / deezer / ximalaya` 返回
+`Value of source is not supported.`（与「国内版音源被下架过一部分」的记录一致）。
+
+**签名可以在纯 JS 里跑，不需要 Node 的 `vm`**（这是插件能成立的关键）：
+把 `crc32.min.js` 用 `new Function("sandbox", "with(sandbox){...}")` 执行，
+`sandbox` 是一个 `has:()=>true` 的 Proxy——未声明的标识符先落到 sandbox（提供
+`location.hostname` / `mkPlayer.version` / 假 `XMLHttpRequest` 返回当前秒级时间戳），
+缺失的再从真实 `globalThis` 兜底。这样站点升级加新依赖也不会立刻炸，且渲染进程未启用 CSP 限制 `unsafe-eval`。
+
+**两个新踩的坑（此前文档没有）**：
+
+1. **`br` 是标称档位，不是真实码率**。`types=url&br=999` 返回 `br:999`，但《晴天》55,397,039 字节 / 269 秒
+   反推是 **1647kbps**。如果用 `size*8/br` 估时长来做版本校验，会把真无损全部判成「时长不符」而丢掉
+   （实测导致 5 首里 4 首降级成 128k、1 首直接无结果）。
+   正确做法：`实际码率 = size*8/播放器已知时长`，再按档位区间校验（999→420~4600、320→230~400、128→88~175）。
+2. **签名入参只能编码一次**。查询串里用 `encodeURIComponent(name)`，签名也对该编码串计算；
+   若再经 `URLSearchParams` 二次编码，服务端解出来的值对不上 → 一律 `{"detail":"Invalid request."}`
+   （`types=url` 的主参数是 `id` 而不是 `name`；`joox` 的 id 含 `+ / =`，这大概就是它取流为空的原因之一）。
+
+## 14. 插件设计要点
+
+- **模式**：兜底（`after-catalog`，默认）/ 优先（`before-catalog`）/ 关闭；改模式重新注册。
+- **匹配**：曲名/歌手归一化（繁→简、去标点）+ 二元组 Dice；查询未写 Live/Remix 而候选带 → 重罚。
+- **省配额**：请求串行 300ms 间隔 + 搜索缓存 30min + 地址缓存 20min（站点限流口径 50 次/5 分钟）。
+- **特效音轨**（人声/伴奏分离）GD 没有，`match` 里直接放行给宿主。
+- 实测 6 首（晴天/稻香/富士山下/Bohemian Rhapsody/海阔天空/起风了）全部命中，5 首真 FLAC，
+  单首 2.2~6.3 秒；6 首里包括 EchoMusic 原本会失败的两首 VIP 曲目。
+
+
