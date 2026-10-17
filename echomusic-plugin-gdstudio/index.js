@@ -422,7 +422,14 @@ const createRuntime = (ctx, getSettings) => {
     } catch (error) {
       if (!error?.signatureRejected) throw error;
       log("签名被拒，刷新 crc32.min.js 重试一次");
-      return attempt(true);
+      try {
+        return await attempt(true);
+      } catch (retryError) {
+        // 站点偶发把「刚刚超频」也回成 Invalid request，隔一会儿再试一次
+        if (!retryError?.signatureRejected) throw retryError;
+        await new Promise((resolve) => setTimeout(resolve, 900));
+        return attempt(true);
+      }
     }
   };
 
@@ -1173,7 +1180,21 @@ const createDownloadPage = ({ ctx, runtime, engine, getSettings, proxy }) => {
         }
       };
 
+      /** 下载前必须有授权目录，否则任务会在引擎里失败得莫名其妙 */
+      const requireDirectory = () => {
+        if (!caps.canDownload) {
+          ctx.toast.warning("当前版本没有下载接口，请用「复制直链」配合命令行下载器");
+          return false;
+        }
+        if (!directory.value) {
+          ctx.toast.warning("请先选择保存目录");
+          return false;
+        }
+        return true;
+      };
+
       const addBatch = () => {
+        if (!requireDirectory()) return;
         const parsed = engine.parseTrackLines(batchText.value);
         if (!parsed.length) {
           ctx.toast.warning("没有解析到歌曲，每行一首，格式「歌名 - 歌手」");
@@ -1185,6 +1206,7 @@ const createDownloadPage = ({ ctx, runtime, engine, getSettings, proxy }) => {
       };
 
       const addQueue = () => {
+        if (!requireDirectory()) return;
         let songs = [];
         try {
           songs = ctx.playlist?.getQueueSongs?.() || [];
@@ -1205,6 +1227,7 @@ const createDownloadPage = ({ ctx, runtime, engine, getSettings, proxy }) => {
       };
 
       const addCurrent = () => {
+        if (!requireDirectory()) return;
         const track = ctx.player?.currentTrack;
         if (!track) {
           ctx.toast.warning("当前没有播放中的歌曲");
@@ -1253,6 +1276,7 @@ const createDownloadPage = ({ ctx, runtime, engine, getSettings, proxy }) => {
       };
 
       const downloadItem = (item) => {
+        if (!requireDirectory()) return;
         const result = engine.enqueue([
           {
             title: item.name,
