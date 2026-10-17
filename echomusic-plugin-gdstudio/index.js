@@ -644,13 +644,953 @@ const mergeSettings = (saved) => {
 };
 
 /* ------------------------------------------------------------------ *
+ * 下载引擎
+ *
+ * 走宿主传输引擎 (ctx.net.download)：沿用宿主代理、支持续传与进度、
+ * 直接流式写入用户授权的目录（不在 renderer 里搬字节）。
+ * 该 API 需要 EchoMusic >= 2.3.2-beta.10；2.3.1 上自动降级为「解析 + 复制直链」。
+ * ------------------------------------------------------------------ */
+
+const DIR_KEY = "download.dir";
+const MAX_QUEUE = 200;
+const DOWNLOAD_CONCURRENCY = 2; // 宿主对单个插件放宽到 2 个并发传输
+
+const stripUnsafe = (text) =>
+  String(text || "")
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const trimSegment = (text, fallback, max = 80) => {
+  const value = stripUnsafe(text).slice(0, max).replace(/[. ]+$/, "");
+  return value || fallback;
+};
+
+const extFromUrl = (url, br) => {
+  const matched = String(url).match(/\.([a-z0-9]{2,5})(?:\?|#|$)/i);
+  const ext = matched ? matched[1].toLowerCase() : "";
+  if (["flac", "mp3", "m4a", "ogg", "aac", "wav", "opus"].includes(ext)) return ext;
+  return br >= 600 ? "flac" : "mp3";
+};
+
+/** 批量文本 → [{title, artist}]，支持「歌名 - 歌手」「歌名—歌手」「序号. 歌名 - 歌手」 */
+const TRACK_SEP_RE = /\s+[-–—|]\s+|\t+|\s*—\s*/;
+
+const parseTrackLines = (text) =>
+  String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const cleaned = line.replace(/^\d{1,3}[.、)]\s*/, "").replace(/^#+\s*/, "").trim();
+      const parts = cleaned.split(TRACK_SEP_RE).map((one) => one.trim()).filter(Boolean);
+      if (parts.length >= 2) return { title: parts[0], artist: parts[1] };
+      return { title: cleaned, artist: "" };
+    })
+    .filter((item) => item.title);
+
+const createDownloadEngine = ({ ctx, runtime, getSettings }) => {
+  const tasks = [];
+  const listeners = new Set();
+  let directory = null;
+  let sequence = 0;
+  let running = 0;
+  let emitTimer = null;
+
+  const canDownload = () =>
+    typeof ctx.net?.download === "function" && typeof ctx.fs?.requestDirectory === "function";
+
+  const capability = () => ({
+    canDownload: canDownload(),
+    canPickDirectory: typeof ctx.fs?.requestDirectory === "function",
+    canClipboard: typeof navigator !== "undefined" && !!navigator.clipboard,
+  });
+
+  const snapshot = () =>
+    tasks.map((task) => ({
+      key: task.key,
+      title: task.title,
+      artist: task.artist,
+      status: task.status,
+      received: task.received,
+      total: task.total,
+      speed: task.speed,
+      error: task.error,
+      source: task.source,
+      br: task.br,
+      relativePath: task.relativePath,
+    }));
+
+  const emit = () => {
+    if (emitTimer) return;
+    emitTimer = setTimeout(() => {
+      emitTimer = null;
+      const payload = snapshot();
+      listeners.forEach((handler) => {
+        try {
+          handler(payload);
+        } catch {}
+      });
+    }, 150);
+  };
+
+  const subscribe = (handler) => {
+    listeners.add(handler);
+    handler(snapshot());
+    return () => listeners.delete(handler);
+  };
+
+  const loadDirectory = async () => {
+    if (directory) return directory;
+    const saved = await ctx.storage.get(DIR_KEY).catch(() => null);
+    if (!saved?.id) return null;
+    // 授权可能被用户在「已授权文件与目录」里撤销
+    try {
+      const grants = await ctx.fs?.listDirectoryGrants?.();
+      if (Array.isArray(grants)) {
+        const hit = grants.find((one) => one.id === saved.id);
+        if (hit && hit.available === false) return null;
+      }
+    } catch {}
+    directory = saved;
+    return directory;
+  };
+
+  const pickDirectory = async () => {
+    if (typeof ctx.fs?.requestDirectory !== "function") {
+      throw new Error("当前 EchoMusic 版本不支持选择保存目录（需要 2.3.2-beta.10 及以上）");
+    }
+    const selection = await ctx.fs.requestDirectory({
+      access: "read-write",
+      purpose: "保存 GD 音乐台下载的歌曲",
+      persist: true,
+    });
+    if (!selection?.ok) throw new Error(selection?.error?.message || "选择目录失败");
+    if (selection.canceled) return null;
+    directory = {
+      id: selection.directory.id,
+      displayPath: selection.directory.displayPath || selection.directory.name,
+      name: selection.directory.name,
+    };
+    await ctx.storage.set(DIR_KEY, directory).catch(() => {});
+    return directory;
+  };
+
+  const getDirectory = () => directory;
+
+  const qualityForBr = (maxBr) => (Number(maxBr) >= 740 ? "flac" : Number(maxBr) >= 320 ? "320" : "128");
+
+  const buildRelativePath = (task, ext) => {
+    const artist = trimSegment(task.artist, "未知歌手", 60);
+    const title = trimSegment(task.title, "未命名", 80);
+    return `${artist}/${title}.${ext}`;
+  };
+
+  const runTask = async (task) => {
+    const settings = getSettings();
+    task.status = "resolving";
+    task.error = "";
+    emit();
+
+    const hit = await runtime.resolveTrack(
+      {
+        title: task.title,
+        artist: task.artist,
+        album: task.album,
+        duration: task.duration,
+      },
+      qualityForBr(settings.maxBr),
+    );
+    if (!hit) throw new Error("没有找到可用的音源（可能是冷门曲目或音源被限流）");
+
+    task.source = hit.source;
+    task.br = hit.br;
+    const ext = extFromUrl(hit.url, hit.br);
+    task.relativePath = buildRelativePath(task, ext);
+    task.status = "downloading";
+    task.received = 0;
+    task.total = 0;
+    emit();
+
+    const dir = directory || (await loadDirectory());
+    if (!dir) throw new Error("还没有选择保存目录");
+
+    const handle = await ctx.net.download({
+      url: hit.url,
+      target: { directoryId: dir.id, relativePath: task.relativePath },
+      headers: { "User-Agent": UA, Referer: `https://${HOSTS[getSettings().site] || HOSTS.org}/` },
+      name: `${task.artist || "未知歌手"} - ${task.title}`,
+      conflict: "rename",
+    });
+    task.handle = handle;
+
+    const unsubscribe = handle.subscribe((snap) => {
+      task.received = Number(snap?.receivedBytes) || 0;
+      task.total = Number(snap?.totalBytes) || 0;
+      task.speed = Number(snap?.bytesPerSecond) || 0;
+      if (snap?.state && snap.state !== task.status) {
+        if (snap.state === "paused") task.status = "paused";
+        else if (snap.state === "downloading" || snap.state === "connecting") task.status = "downloading";
+      }
+      emit();
+    });
+
+    try {
+      const result = await handle.wait();
+      task.status = "completed";
+      task.received = Number(result?.bytes) || task.received || task.total;
+      task.total = task.received;
+      task.relativePath = result?.file?.relativePath || task.relativePath;
+    } finally {
+      unsubscribe?.();
+      task.handle = null;
+    }
+  };
+
+  const pump = () => {
+    while (running < DOWNLOAD_CONCURRENCY) {
+      const next = tasks.find((task) => task.status === "pending");
+      if (!next) break;
+      running += 1;
+      void (async () => {
+        try {
+          await runTask(next);
+        } catch (error) {
+          if (next.canceled) {
+            next.status = "canceled";
+          } else {
+            next.status = "failed";
+            next.error = String(error?.message || error);
+          }
+        } finally {
+          running -= 1;
+          emit();
+          pump();
+        }
+      })();
+    }
+  };
+
+  const enqueue = (items) => {
+    let added = 0;
+    let skipped = 0;
+    for (const item of Array.isArray(items) ? items : []) {
+      const title = String(item?.title || "").trim();
+      if (!title) {
+        skipped += 1;
+        continue;
+      }
+      const artist = String(item?.artist || "").trim();
+      const dedupeKey = `${normalizeText(title)}|${normalizeText(artist)}`;
+      const active = tasks.some(
+        (task) =>
+          task.dedupeKey === dedupeKey &&
+          task.status !== "failed" &&
+          task.status !== "canceled" &&
+          task.status !== "completed",
+      );
+      if (active || tasks.length >= MAX_QUEUE) {
+        skipped += 1;
+        continue;
+      }
+      tasks.push({
+        key: `gd-${++sequence}`,
+        dedupeKey,
+        title,
+        artist,
+        album: String(item?.album || ""),
+        duration: Number(item?.duration) || 0,
+        status: "pending",
+        received: 0,
+        total: 0,
+        speed: 0,
+        error: "",
+        source: "",
+        br: 0,
+        relativePath: "",
+        canceled: false,
+        handle: null,
+      });
+      added += 1;
+    }
+    emit();
+    if (!running) void loadDirectory().then(() => pump());
+    else pump();
+    return { added, skipped };
+  };
+
+  const cancel = (key) => {
+    const task = tasks.find((one) => one.key === key);
+    if (!task) return;
+    task.canceled = true;
+    if (task.handle) {
+      try {
+        void task.handle.cancel();
+      } catch {}
+    }
+    if (task.status === "pending" || task.status === "resolving") task.status = "canceled";
+    emit();
+  };
+
+  const retry = (key) => {
+    const task = tasks.find((one) => one.key === key);
+    if (!task) return;
+    task.status = "pending";
+    task.error = "";
+    task.canceled = false;
+    task.received = 0;
+    task.total = 0;
+    emit();
+    pump();
+  };
+
+  const remove = (key) => {
+    const index = tasks.findIndex((one) => one.key === key);
+    if (index < 0) return;
+    if (tasks[index].handle) cancel(key);
+    tasks.splice(index, 1);
+    emit();
+  };
+
+  const clearFinished = () => {
+    for (let index = tasks.length - 1; index >= 0; index -= 1) {
+      if (["completed", "failed", "canceled"].includes(tasks[index].status)) tasks.splice(index, 1);
+    }
+    emit();
+  };
+
+  return {
+    capability,
+    subscribe,
+    snapshot,
+    enqueue,
+    parseTrackLines,
+    cancel,
+    retry,
+    remove,
+    clearFinished,
+    loadDirectory,
+    pickDirectory,
+    getDirectory,
+  };
+};
+
+/* ------------------------------------------------------------------ *
+ * 代理（读写客户端全局网络设置）
+ *
+ * EchoMusic 的代理是应用级的：主进程 axios 走 Chromium adapter，下载也沿用宿主代理，
+ * 所以插件里的所有请求本来就会跟随它。这里提供读写入口，省得来回翻设置页。
+ * 写入通过 preload 暴露的 window.electron.network.update，与「设置 → 网络」同一通道。
+ * ------------------------------------------------------------------ */
+
+const createProxyApi = (ctx) => {
+  const bridge = () => (typeof window !== "undefined" ? window.electron?.network : null);
+
+  const supported = () => typeof bridge()?.update === "function";
+
+  const read = async () => {
+    const api = bridge();
+    if (typeof api?.get === "function") {
+      const result = await api.get();
+      if (result?.settings) return result.settings;
+    }
+    const store = ctx.stores?.settings;
+    if (!store) return null;
+    return {
+      proxyMode: store.proxyMode,
+      proxyPacScript: store.proxyPacScript,
+      proxyRules: store.proxyRules,
+      proxyUsername: store.proxyUsername,
+      proxyBypassRules: store.proxyBypassRules,
+      kugouApiTimeoutSecs: store.kugouApiTimeoutSecs,
+      playerNetworkTimeoutSecs: store.playerNetworkTimeoutSecs,
+    };
+  };
+
+  const apply = async (patch) => {
+    const api = bridge();
+    if (typeof api?.update !== "function") {
+      throw new Error("当前版本不支持从插件修改网络设置，请到「设置 → 网络」里配置");
+    }
+    const current = await read();
+    const result = await api.update({ settings: { ...(current || {}), ...patch } });
+    try {
+      ctx.stores?.settings?.applyNetworkSettings?.(result.settings);
+    } catch {}
+    return result.settings;
+  };
+
+  /** 出口自检：Cloudflare trace 会回显客户端 IP 与落地机房，用来确认代理是否生效 */
+  const egress = async () => {
+    const startedAt = Date.now();
+    const text = await ctx.net.request({
+      url: `https://${HOSTS.org}/cdn-cgi/trace`,
+      method: "GET",
+      responseType: "text",
+      timeoutMs: 10000,
+      headers: { "User-Agent": UA },
+    });
+    const body = String(text?.data || "");
+    const fields = {};
+    body
+      .trim()
+      .split("\n")
+      .forEach((line) => {
+        const index = line.indexOf("=");
+        if (index > 0) fields[line.slice(0, index)] = line.slice(index + 1);
+      });
+    return {
+      ip: fields.ip || "",
+      loc: fields.loc || "",
+      colo: fields.colo || "",
+      ms: Date.now() - startedAt,
+      raw: body,
+    };
+  };
+
+  return { read, apply, egress, supported };
+};
+
+/* ------------------------------------------------------------------ *
+ * 前端：下载页（侧边栏入口）
+ * ------------------------------------------------------------------ */
+
+const PAGE_CSS = `
+.gd-page { display: flex; flex-direction: column; gap: 14px; padding: 18px 20px 40px; color: var(--color-text-main, inherit); }
+.gd-card { border: 1px solid var(--color-border, rgba(148,163,184,.28)); border-radius: 14px; padding: 14px 16px; background: color-mix(in srgb, var(--color-text-main, #64748b) 4%, transparent); }
+.gd-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.gd-title h2 { margin: 0; font-size: 17px; font-weight: 700; }
+.gd-title p { margin: 4px 0 0; font-size: 12px; opacity: .62; }
+.gd-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.gd-btn { height: 30px; padding: 0 12px; border-radius: 8px; border: 1px solid var(--color-border, rgba(148,163,184,.35)); background: transparent; color: inherit; font-size: 12.5px; cursor: pointer; transition: .15s; }
+.gd-btn:hover { background: color-mix(in srgb, var(--color-text-main, #64748b) 8%, transparent); }
+.gd-btn:disabled { opacity: .45; cursor: default; }
+.gd-btn-primary { background: var(--color-primary, #0ea5e9); border-color: transparent; color: #fff; }
+.gd-btn-primary:hover { filter: brightness(1.06); background: var(--color-primary, #0ea5e9); }
+.gd-btn-danger { color: #dc2626; border-color: color-mix(in srgb, #dc2626 40%, transparent); }
+.gd-input, .gd-select, .gd-textarea { border: 1px solid var(--color-border, rgba(148,163,184,.35)); background: transparent; color: inherit; border-radius: 8px; font-size: 13px; padding: 6px 10px; outline: none; font-family: inherit; }
+.gd-input { height: 30px; flex: 1; min-width: 160px; }
+.gd-select { height: 30px; }
+.gd-textarea { width: 100%; min-height: 84px; resize: vertical; line-height: 1.55; }
+.gd-hint { font-size: 12px; opacity: .62; line-height: 1.6; }
+.gd-warn { font-size: 12.5px; line-height: 1.6; padding: 10px 12px; border-radius: 10px; background: color-mix(in srgb, #f59e0b 16%, transparent); border: 1px solid color-mix(in srgb, #f59e0b 40%, transparent); }
+.gd-list { display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow: auto; }
+.gd-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 10px; border-radius: 10px; background: color-mix(in srgb, var(--color-text-main, #64748b) 5%, transparent); }
+.gd-item-main { min-width: 0; }
+.gd-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gd-sub { font-size: 11.5px; opacity: .6; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+.gd-bar { height: 5px; border-radius: 999px; background: color-mix(in srgb, var(--color-text-main, #64748b) 14%, transparent); overflow: hidden; margin-top: 6px; }
+.gd-bar-fill { height: 100%; border-radius: 999px; background: var(--color-primary, #0ea5e9); transition: width .25s; }
+.gd-tag { display: inline-flex; align-items: center; height: 18px; padding: 0 7px; border-radius: 999px; font-size: 10.5px; background: color-mix(in srgb, var(--color-text-main, #64748b) 12%, transparent); }
+.gd-tag.ok { background: color-mix(in srgb, #16a34a 22%, transparent); color: #16a34a; }
+.gd-tag.err { background: color-mix(in srgb, #dc2626 20%, transparent); color: #dc2626; }
+.gd-empty { font-size: 12.5px; opacity: .55; padding: 12px 2px; }
+.gd-grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+`;
+
+const createDownloadPage = ({ ctx, runtime, engine, getSettings, proxy }) => {
+  const vue = ctx.vue || {};
+  const defineComponent = vue.defineComponent || ((options) => options);
+  const h = vue.h;
+  const ref = vue.ref || ((value) => ({ value }));
+  const onMounted = vue.onMounted || ((callback) => void callback());
+  const onUnmounted = vue.onUnmounted || (() => {});
+
+  return defineComponent({
+    name: "GdDownloadPage",
+    setup() {
+      const caps = engine.capability();
+      const tasks = ref(engine.snapshot());
+      const directory = ref(engine.getDirectory());
+      const keyword = ref("");
+      const results = ref([]);
+      const searching = ref(false);
+      const batchText = ref("");
+      const statusText = ref("");
+      const busy = ref(false);
+      const proxyState = ref(null);
+      const egressInfo = ref(null);
+      const proxyMode = ref("system");
+      const proxyRules = ref("");
+      const showProxy = ref(false);
+      let unsubscribe = null;
+
+      onMounted(async () => {
+        unsubscribe = engine.subscribe((snapshot) => {
+          tasks.value = snapshot;
+        });
+        directory.value = await engine.loadDirectory().catch(() => null);
+        try {
+          const state = await proxy.read();
+          proxyState.value = state;
+          if (state) {
+            proxyMode.value = state.proxyMode || "system";
+            proxyRules.value = state.proxyRules || "";
+          }
+        } catch {}
+      });
+
+      onUnmounted(() => {
+        if (typeof unsubscribe === "function") unsubscribe();
+      });
+
+      const formatBytes = (bytes) => {
+        const value = Number(bytes) || 0;
+        if (value < 1024) return `${value} B`;
+        if (value < 1024 * 1024) return `${(value / 1024).toFixed(0)} KB`;
+        if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+        return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
+      };
+
+      const statusLabel = (status) => {
+        const map = {
+          pending: "排队中",
+          resolving: "匹配音源",
+          downloading: "下载中",
+          paused: "已暂停",
+          completed: "已完成",
+          failed: "失败",
+          canceled: "已取消",
+        };
+        return map[status] || status;
+      };
+
+      const progressOf = (task) => {
+        if (task.status === "completed") return 100;
+        if (!task.total) return task.status === "downloading" ? 12 : 0;
+        return Math.min(100, Math.round((task.received / task.total) * 100));
+      };
+
+      const chooseDirectory = async () => {
+        try {
+          const picked = await engine.pickDirectory();
+          if (picked) {
+            directory.value = picked;
+            ctx.toast.success(`保存目录：${picked.displayPath}`);
+          }
+        } catch (error) {
+          ctx.toast.danger(String(error?.message || error));
+        }
+      };
+
+      const addBatch = () => {
+        const parsed = engine.parseTrackLines(batchText.value);
+        if (!parsed.length) {
+          ctx.toast.warning("没有解析到歌曲，每行一首，格式「歌名 - 歌手」");
+          return;
+        }
+        const result = engine.enqueue(parsed);
+        statusText.value = `已加入 ${result.added} 首${result.skipped ? `，跳过 ${result.skipped} 首（重复或超限）` : ""}`;
+        if (result.added) batchText.value = "";
+      };
+
+      const addQueue = () => {
+        let songs = [];
+        try {
+          songs = ctx.playlist?.getQueueSongs?.() || [];
+        } catch {}
+        if (!songs.length) {
+          ctx.toast.warning("当前播放队列是空的");
+          return;
+        }
+        const result = engine.enqueue(
+          songs.map((song) => ({
+            title: song.title || song.name,
+            artist: song.artist,
+            album: song.albumName || song.album,
+            duration: song.duration,
+          })),
+        );
+        statusText.value = `队列导入 ${result.added} 首${result.skipped ? `，跳过 ${result.skipped} 首` : ""}`;
+      };
+
+      const addCurrent = () => {
+        const track = ctx.player?.currentTrack;
+        if (!track) {
+          ctx.toast.warning("当前没有播放中的歌曲");
+          return;
+        }
+        const result = engine.enqueue([
+          {
+            title: track.title || track.name,
+            artist: track.artist,
+            album: track.albumName || track.album,
+            duration: track.duration,
+          },
+        ]);
+        if (!result.added) ctx.toast.info("这首歌已经在队列里了");
+      };
+
+      const doSearch = async () => {
+        const value = keyword.value.trim();
+        if (!value) return;
+        searching.value = true;
+        results.value = [];
+        try {
+          const sources = getSettings().sources || [];
+          const collected = [];
+          const seen = new Set();
+          for (const source of sources) {
+            let list = [];
+            try {
+              list = await runtime.search(value, source, 8);
+            } catch (error) {
+              continue;
+            }
+            for (const item of list) {
+              const key = `${normalizeText(item.name)}|${normalizeText((item.artist || []).join(""))}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              collected.push({ ...item, gdSource: source });
+            }
+            if (collected.length >= 20) break;
+          }
+          results.value = collected.slice(0, 24);
+          if (!collected.length) statusText.value = "没有搜到结果，换个关键词或音源试试";
+        } finally {
+          searching.value = false;
+        }
+      };
+
+      const downloadItem = (item) => {
+        const result = engine.enqueue([
+          {
+            title: item.name,
+            artist: (item.artist || []).join(" / "),
+            album: item.album,
+          },
+        ]);
+        if (result.added) ctx.toast.success(`已加入队列：${item.name}`);
+        else ctx.toast.info("这首歌已经在队列里了");
+      };
+
+      const copyUrl = async (item) => {
+        busy.value = true;
+        try {
+          const hit = await runtime.resolveTrack(
+            {
+              title: item.name,
+              artist: (item.artist || []).join(" "),
+              album: item.album,
+            },
+            Number(getSettings().maxBr) >= 740 ? "flac" : "320",
+          );
+          if (!hit) {
+            ctx.toast.warning("没有取到可用直链");
+            return;
+          }
+          await navigator.clipboard.writeText(hit.url);
+          ctx.toast.success(`已复制 ${hit.source} 直链（${hit.br}kbps）`);
+        } catch (error) {
+          ctx.toast.danger(String(error?.message || error));
+        } finally {
+          busy.value = false;
+        }
+      };
+
+      const applyProxy = async (mode, rules) => {
+        busy.value = true;
+        try {
+          const state = await proxy.apply({
+            proxyMode: mode,
+            proxyRules: mode === "fixed_servers" ? rules : (proxyState.value?.proxyRules || ""),
+          });
+          proxyState.value = state;
+          proxyMode.value = state.proxyMode;
+          ctx.toast.success("网络代理已更新（对客户端全局生效）");
+        } catch (error) {
+          ctx.toast.danger(String(error?.message || error));
+        } finally {
+          busy.value = false;
+        }
+      };
+
+      const checkEgress = async () => {
+        busy.value = true;
+        try {
+          egressInfo.value = await proxy.egress();
+        } catch (error) {
+          ctx.toast.danger(`出口检测失败：${String(error?.message || error)}`);
+        } finally {
+          busy.value = false;
+        }
+      };
+
+      const renderTask = (task) => {
+        const pct = progressOf(task);
+        const failed = task.status === "failed";
+        return h("div", { class: "gd-item", key: task.key }, [
+          h("div", { class: "gd-item-main" }, [
+            h("div", { class: "gd-name" }, task.title || "未命名"),
+            h("div", { class: "gd-sub" }, [
+              task.artist || "未知歌手",
+              task.source ? ` · ${task.source}` : "",
+              task.br ? ` · ${task.br}kbps` : "",
+              task.status === "downloading" && task.total
+                ? ` · ${formatBytes(task.received)} / ${formatBytes(task.total)} · ${formatBytes(task.speed)}/s`
+                : "",
+              task.error ? ` · ${task.error}` : "",
+            ]),
+            h("div", { class: "gd-bar" }, [
+              h("div", {
+                class: "gd-bar-fill",
+                style: `width:${pct}%;${failed ? "background:#dc2626" : ""}`,
+              }),
+            ]),
+          ]),
+          h("div", { class: "gd-row" }, [
+            h(
+              "span",
+              { class: `gd-tag${task.status === "completed" ? " ok" : failed ? " err" : ""}` },
+              statusLabel(task.status),
+            ),
+            ["pending", "resolving", "downloading", "paused"].includes(task.status)
+              ? h("button", { class: "gd-btn", onClick: () => engine.cancel(task.key) }, "取消")
+              : null,
+            failed || task.status === "canceled"
+              ? h("button", { class: "gd-btn", onClick: () => engine.retry(task.key) }, "重试")
+              : null,
+            ["completed", "failed", "canceled"].includes(task.status)
+              ? h("button", { class: "gd-btn", onClick: () => engine.remove(task.key) }, "移除")
+              : null,
+          ]),
+        ]);
+      };
+
+      return () =>
+        h("div", { class: "gd-page" }, [
+          h("div", { class: "gd-card" }, [
+            h("div", { class: "gd-title" }, [
+              h("div", null, [
+                h("h2", null, "GD 音乐台下载"),
+                h(
+                  "p",
+                  null,
+                  `音源：${(getSettings().sources || []).join(" / ") || "未配置"} · 最高 ${getSettings().maxBr} 档 · ` +
+                    `已启用音源接管：${getSettings().mode === "prefer" ? "优先" : getSettings().mode === "off" ? "关闭" : "兜底"}`,
+                ),
+              ]),
+              h("div", { class: "gd-row" }, [
+                h("button", { class: "gd-btn", onClick: addCurrent }, "下载当前播放"),
+                h("button", { class: "gd-btn", onClick: addQueue }, "导入播放队列"),
+              ]),
+            ]),
+          ]),
+
+          h("div", { class: "gd-card" }, [
+            h("div", { class: "gd-row", style: "justify-content:space-between;" }, [
+              h("div", { class: "gd-hint" }, [
+                "保存目录：",
+                h(
+                  "strong",
+                  { style: "opacity:.9;" },
+                  directory.value?.displayPath || "未选择",
+                ),
+              ]),
+              h(
+                "button",
+                { class: "gd-btn", onClick: chooseDirectory, disabled: !caps.canPickDirectory },
+                directory.value ? "更换目录" : "选择目录",
+              ),
+            ]),
+            !caps.canDownload
+              ? h(
+                  "div",
+                  { class: "gd-warn", style: "margin-top:10px;" },
+                  "当前 EchoMusic 版本的插件还不提供下载传输接口（需要 2.3.2-beta.10 及以上）。" +
+                    "你仍然可以搜索并用「复制直链」拿到地址，再用仓库里的命令行下载器落盘。",
+                )
+              : null,
+          ]),
+
+          h("div", { class: "gd-card" }, [
+            h("div", { class: "gd-row", style: "margin-bottom:8px;" }, [
+              h("strong", { style: "font-size:13px;" }, "批量添加"),
+              h("span", { class: "gd-hint" }, "每行一首，「歌名 - 歌手」，例如：晴天 - 周杰伦"),
+            ]),
+            h("textarea", {
+              class: "gd-textarea",
+              value: batchText.value,
+              placeholder: "晴天 - 周杰伦\n稻香 - 周杰伦\n富士山下 - 陈奕迅",
+              onInput: (event) => {
+                batchText.value = event.target.value;
+              },
+            }),
+            h("div", { class: "gd-row", style: "margin-top:8px;" }, [
+              h("button", { class: "gd-btn gd-btn-primary", onClick: addBatch }, "解析并加入队列"),
+              h(
+                "button",
+                { class: "gd-btn", onClick: () => engine.clearFinished() },
+                "清空已结束",
+              ),
+              statusText.value ? h("span", { class: "gd-hint" }, statusText.value) : null,
+            ]),
+          ]),
+
+          h("div", { class: "gd-card" }, [
+            h("div", { class: "gd-row", style: "margin-bottom:8px;" }, [
+              h("strong", { style: "font-size:13px;" }, "搜索曲库"),
+              h("input", {
+                class: "gd-input",
+                value: keyword.value,
+                placeholder: "歌名 歌手",
+                onInput: (event) => {
+                  keyword.value = event.target.value;
+                },
+                onKeydown: (event) => {
+                  if (event.key === "Enter") void doSearch();
+                },
+              }),
+              h(
+                "button",
+                { class: "gd-btn", onClick: doSearch, disabled: searching.value },
+                searching.value ? "搜索中…" : "搜索",
+              ),
+            ]),
+            results.value.length
+              ? h(
+                  "div",
+                  { class: "gd-list" },
+                  results.value.map((item) =>
+                    h("div", { class: "gd-item", key: `${item.gdSource}-${item.id}` }, [
+                      h("div", { class: "gd-item-main" }, [
+                        h("div", { class: "gd-name" }, item.name),
+                        h(
+                          "div",
+                          { class: "gd-sub" },
+                          `${(item.artist || []).join(" / ") || "未知歌手"}${item.album ? ` · ${item.album}` : ""} · ${item.gdSource}`,
+                        ),
+                      ]),
+                      h("div", { class: "gd-row" }, [
+                        h(
+                          "button",
+                          { class: "gd-btn", onClick: () => downloadItem(item) },
+                          "下载",
+                        ),
+                        h(
+                          "button",
+                          { class: "gd-btn", onClick: () => copyUrl(item), disabled: busy.value },
+                          "复制直链",
+                        ),
+                      ]),
+                    ]),
+                  ),
+                )
+              : h("div", { class: "gd-empty" }, "输入关键词搜索 QQ 音乐 / 酷我 / 网易云等音源"),
+          ]),
+
+          h("div", { class: "gd-card" }, [
+            h("div", { class: "gd-row", style: "justify-content:space-between;margin-bottom:8px;" }, [
+              h("strong", { style: "font-size:13px;" }, `下载队列${tasks.value.length ? `（${tasks.value.length}）` : ""}`),
+              h("span", { class: "gd-hint" }, `并发 ${DOWNLOAD_CONCURRENCY} 个 · 站点限流约 50 次/5 分钟`),
+            ]),
+            tasks.value.length
+              ? h("div", { class: "gd-list" }, tasks.value.map(renderTask))
+              : h("div", { class: "gd-empty" }, "队列是空的。可以从搜索结果、当前播放或批量文本添加。"),
+          ]),
+
+          h("div", { class: "gd-card" }, [
+            h("div", { class: "gd-row", style: "justify-content:space-between;" }, [
+              h("div", null, [
+                h("strong", { style: "font-size:13px;" }, "网络代理"),
+                h(
+                  "div",
+                  { class: "gd-hint" },
+                  proxyState.value
+                    ? `当前：${proxyModeLabel(proxyState.value.proxyMode)}${proxyState.value.proxyRules ? ` · ${proxyState.value.proxyRules}` : ""}`
+                    : "读取中…",
+                ),
+              ]),
+              h(
+                "button",
+                { class: "gd-btn", onClick: () => (showProxy.value = !showProxy.value) },
+                showProxy.value ? "收起" : "配置",
+              ),
+            ]),
+            showProxy.value
+              ? h("div", { style: "margin-top:12px;display:grid;gap:10px;" }, [
+                  h("div", { class: "gd-hint" }, [
+                    "插件不单独设代理：播放在线音源与下载都沿用客户端全局网络设置。",
+                    h("br"),
+                    "这里改的是「设置 → 网络」，会同时影响酷狗播放，所以换完建议先点「检测出口」。",
+                  ]),
+                  h("div", { class: "gd-row" }, [
+                    h(
+                      "select",
+                      {
+                        class: "gd-select",
+                        value: proxyMode.value,
+                        onChange: (event) => {
+                          proxyMode.value = event.target.value;
+                        },
+                      },
+                      [
+                        h("option", { value: "system" }, "跟随系统代理"),
+                        h("option", { value: "direct" }, "强制直连"),
+                        h("option", { value: "fixed_servers" }, "自定义代理"),
+                      ],
+                    ),
+                    proxyMode.value === "fixed_servers"
+                      ? h("input", {
+                          class: "gd-input",
+                          value: proxyRules.value,
+                          placeholder: "http://127.0.0.1:1087",
+                          onInput: (event) => {
+                            proxyRules.value = event.target.value;
+                          },
+                        })
+                      : null,
+                    h(
+                      "button",
+                      {
+                        class: "gd-btn gd-btn-primary",
+                        disabled: busy.value || !proxy.supported(),
+                        onClick: () => void applyProxy(proxyMode.value, proxyRules.value),
+                      },
+                      "应用",
+                    ),
+                    h(
+                      "button",
+                      { class: "gd-btn", onClick: checkEgress, disabled: busy.value },
+                      "检测出口",
+                    ),
+                  ]),
+                  !proxy.supported()
+                    ? h("div", { class: "gd-hint" }, "当前版本不允许插件改网络设置，请到「设置 → 网络」手动配置；下面的检测仍可使用。")
+                    : null,
+                  egressInfo.value
+                    ? h(
+                        "div",
+                        { class: "gd-hint" },
+                        `出口 IP ${egressInfo.value.ip || "未知"} · 地区 ${egressInfo.value.loc || "?"} · 机房 ${egressInfo.value.colo || "?"} · ${egressInfo.value.ms}ms`,
+                      )
+                    : null,
+                ])
+              : null,
+          ]),
+        ]);
+    },
+  });
+};
+
+const proxyModeLabel = (mode) => {
+  if (mode === "direct") return "强制直连";
+  if (mode === "fixed_servers") return "自定义代理";
+  if (mode === "pac_script") return "PAC 脚本";
+  return "跟随系统代理";
+};
+
+/* ------------------------------------------------------------------ *
  * 入口
  * ------------------------------------------------------------------ */
 
 export function activate(ctx) {
   let settings = { ...DEFAULT_SETTINGS };
   const runtime = createRuntime(ctx, () => settings);
+  const proxy = createProxyApi(ctx);
+  const engine = createDownloadEngine({ ctx, runtime, getSettings: () => settings });
   let disposeResolver = null;
+  let disposePage = null;
   let disposed = false;
 
   const persist = async () => {
@@ -993,20 +1933,49 @@ export function activate(ctx) {
     } catch (error) {
       console.warn(LOG_TAG, "设置面板注册失败", error);
     }
+
+    // 下载页（侧边栏入口）
+    try {
+      if (typeof ctx.css?.inject === "function") ctx.css.inject(PAGE_CSS, { id: "gd-download" });
+      const addPage = ctx.ui?.addPage || ctx.ui?.pages?.register;
+      if (typeof addPage === "function") {
+        disposePage = addPage.call(ctx.ui, {
+          id: "downloads",
+          title: "GD 下载",
+          icon: "mdi:tray-arrow-down",
+          order: 60,
+          sidebar: { section: "plugins", title: "GD 下载" },
+          component: createDownloadPage({
+            ctx,
+            runtime,
+            engine,
+            getSettings: () => settings,
+            proxy,
+          }),
+        });
+        runtime.log("下载页已注册");
+      } else {
+        runtime.warn("当前版本不支持注册插件页面，下载功能仅在设置面板外不可用");
+      }
+    } catch (error) {
+      console.warn(LOG_TAG, "下载页注册失败", error);
+    }
   })();
 
-  ctx.dispose?.(() => {
-    disposed = true;
-    disposeResolver?.();
-    disposeResolver = null;
-  });
-
-  return () => {
+  const cleanup = () => {
     if (disposed) return;
     disposed = true;
+    try {
+      disposePage?.();
+    } catch {}
+    disposePage = null;
     disposeResolver?.();
     disposeResolver = null;
   };
+
+  ctx.dispose?.(cleanup);
+
+  return cleanup;
 }
 
 export function deactivate() {

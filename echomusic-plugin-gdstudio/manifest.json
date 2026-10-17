@@ -1,14 +1,16 @@
 {
   "id": "gdstudio-source",
   "name": "GD 音乐台音源",
-  "version": "1.0.0",
-  "description": "把 GD 音乐台（music.gdstudio.org）的多音源接入 EchoMusic：酷狗 VIP / 无版权曲目解析失败时，自动改用网易云、QQ、酷我等音源播放。",
+  "version": "1.1.0",
+  "description": "把 GD 音乐台（music.gdstudio.org）的多音源接入 EchoMusic：酷狗 VIP / 无版权曲目解析失败时自动改用网易云、QQ、酷我等音源播放；并下载单曲或整批歌曲到本地。",
   "author": "Tommy",
   "icon": "icon.svg",
   "main": "index.js",
   "capabilities": {
     "audioSource": true,
-    "unrestrictedNetwork": true
+    "unrestrictedNetwork": true,
+    "localFiles": true,
+    "downloads": true
   },
   "requires": {
     "echoMusicVersion": ">=2.2.6"

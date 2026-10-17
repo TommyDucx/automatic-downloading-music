@@ -260,4 +260,47 @@ srcappid=2919 / appid=1014 / iscorrection=1 / privilege_filter=0 / userid=0 / to
 - 实测 6 首（晴天/稻香/富士山下/Bohemian Rhapsody/海阔天空/起风了）全部命中，5 首真 FLAC，
   单首 2.2~6.3 秒；6 首里包括 EchoMusic 原本会失败的两首 VIP 曲目。
 
+---
+
+# 补充（2026-10-17 下午）：下载 + 页面 + 代理（v1.1.0）
+
+> 在音源兜底之上加了「单曲/批量下载 + 侧边栏前端 + 代理面板」。本节只记**平台事实**与坑。
+
+## 15. 插件 UI 与下载 API（以 v2.3.2-beta.16 为准）
+
+| 需求 | 正确入口 | 备注 |
+|---|---|---|
+| 注册整页 | `ctx.ui.addPage({ id, title, icon, order, component, sidebar })` | **没有** `ctx.ui.pages.register`；`sidebar` 传 `true` 或 `{section:'plugins', title}` 才会出现在侧边栏 |
+| 注入样式 | `ctx.css.inject(cssText, { id })` | 第二个参数是 `{id}`，不是字符串 |
+| 选保存目录 | `ctx.fs.requestDirectory({access:'read-write', purpose, persist})` | 返回 `{ok:true,canceled:false,directory}`，`DirectoryRef` 带 `id/displayPath` |
+| 大文件下载 | `ctx.net.download({url, target:{directoryId, relativePath}, headers, name, conflict:'rename'})` | 返回 handle：`subscribe/getSnapshot/wait/pause/resume/cancel`；`wait()` → `{taskId, file, bytes}` |
+| 读当前队列 | `ctx.playlist.getQueueSongs()` | 直接给 `Song[]`，批量导入用这个最省事 |
+
+**版本门槛**：下载/目录授权/`getPrivateDirectory` 都是 `2.3.2-beta.10` 才进主线的。
+2.3.1 的 `ctx.fs.writeFile` 只能写插件目录、**没有 append**、也没有任何下载传输接口——
+所以旧版根本做不了大文件落盘（8 MiB 上限 + 无法续写），别在那上面浪费时间。
+manifest 里 `requires.echoMusicVersion` 写 `>=2.2.6` 即可：能力缺失时插件自己降级（保留音源兜底 + 复制直链）。
+
+**并发**：宿主全局最多 3 个传输、单插件 2 个，队列预算单插件 50。插件的下载队列就按 2 并发设计。
+
+## 16. 代理到底能不能由插件控制
+
+- EchoMusic 的代理是**应用级**的（`设置 → 网络`：system / direct / pac_script / fixed_servers，
+  含用户名密码、bypass 规则），主进程 `axios.defaults.adapter = createElectronAxiosAdapter(...)`，
+  所以**插件里 `ctx.net.request`、`ctx.net.download`、媒体播放全都自动跟随宿主代理**，没有 per-request 代理参数。
+- 想在插件里改它：走 preload 的 `window.electron.network.get()` / `.update({settings})`，
+  与设置页同一个通道；改完再 `ctx.stores.settings.applyNetworkSettings(result.settings)` 同步 store。
+  注意这会**全局生效**（连酷狗播放一起），UI 上必须写清楚。
+- 出口自检的省事办法：请求 `https://music.gdstudio.org/cdn-cgi/trace`，会回
+  `ip/loc/colo`，一眼看出代理是否真的生效（本项目实测直连出口是 `120.229.69.46 / CN`）。
+
+## 17. 下载页设计取舍
+
+- 文件名 `歌手/歌名.ext`，扩展名从 URL 猜（flac/mp3/m4a/ogg），猜不到按码率兜底。
+- 队列在内存里，刷新页面不丢（引擎挂在插件上下文），重启客户端会丢；宿主自己保留了任务记录
+  （`ctx.net.downloads.list/attach`），后续要「重启续传」再补。
+- 批量导入只认「歌名 - 歌手」一种文本格式，解析不了的行按整行当关键词搜。
+- 下载不做元数据内嵌/歌词旁挂：仍由 `flac_metadata_embedder.py` 统一处理，避免两边逻辑打架。
+
+
 
