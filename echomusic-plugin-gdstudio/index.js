@@ -696,7 +696,7 @@ const parseTrackLines = (text) =>
     })
     .filter((item) => item.title);
 
-const createDownloadEngine = ({ ctx, runtime, getSettings }) => {
+const createDownloadEngine = ({ ctx, runtime, getSettings, onFailed }) => {
   const tasks = [];
   const listeners = new Set();
   let directory = null;
@@ -868,6 +868,9 @@ const createDownloadEngine = ({ ctx, runtime, getSettings }) => {
           } else {
             next.status = "failed";
             next.error = String(error?.message || error);
+            try {
+              onFailed?.(next);
+            } catch {}
           }
         } finally {
           running -= 1;
@@ -878,7 +881,7 @@ const createDownloadEngine = ({ ctx, runtime, getSettings }) => {
     }
   };
 
-  const enqueue = (items) => {
+  const enqueue = (items, options = {}) => {
     let added = 0;
     let skipped = 0;
     for (const item of Array.isArray(items) ? items : []) {
@@ -915,6 +918,7 @@ const createDownloadEngine = ({ ctx, runtime, getSettings }) => {
         source: "",
         br: 0,
         relativePath: "",
+        quiet: options.quiet === true,
         canceled: false,
         handle: null,
       });
@@ -966,11 +970,15 @@ const createDownloadEngine = ({ ctx, runtime, getSettings }) => {
     emit();
   };
 
+  const unfinishedCount = () =>
+    tasks.filter((task) => !["completed", "failed", "canceled"].includes(task.status)).length;
+
   return {
     capability,
     subscribe,
     snapshot,
     enqueue,
+    unfinishedCount,
     parseTrackLines,
     cancel,
     retry,
@@ -980,6 +988,82 @@ const createDownloadEngine = ({ ctx, runtime, getSettings }) => {
     pickDirectory,
     getDirectory,
   };
+};
+
+/* ------------------------------------------------------------------ *
+ * 宿主 UI 挂载点辅助
+ * ------------------------------------------------------------------ */
+
+/** Song → 下载队列条目 */
+const songToItem = (song) => ({
+  title: song?.title || song?.name || "",
+  artist:
+    typeof song?.artist === "string"
+      ? song.artist
+      : (song?.artists || song?.singers || [])
+          .map((one) => one?.name)
+          .filter(Boolean)
+          .join(" / "),
+  album: song?.albumName || song?.album || "",
+  duration: Number(song?.duration) || 0,
+});
+
+const unwrapRef = (value) =>
+  value && typeof value === "object" && !Array.isArray(value) && "value" in value
+    ? value.value
+    : value;
+
+/** 在主应用的组件树里按组件名找实例（批量面板的选中状态只存在组件内部） */
+const findVueComponent = (ctx, name) => {
+  const root = ctx.app?._instance;
+  if (!root) return null;
+  const stack = [root];
+  let guard = 0;
+  while (stack.length && guard < 20000) {
+    guard += 1;
+    const instance = stack.pop();
+    const type = instance?.type;
+    const current = type && (type.__name || type.name);
+    if (typeof current === "string" && current === name) return instance;
+    const visit = (vnode) => {
+      if (!vnode || typeof vnode !== "object") return;
+      if (vnode.component) stack.push(vnode.component);
+      if (Array.isArray(vnode.children)) vnode.children.forEach(visit);
+    };
+    visit(instance?.subTree);
+  }
+  return null;
+};
+
+/**
+ * 读取「批量操作」面板里勾选的歌曲。
+ * 面板列表是虚拟滚动，DOM 里只有可见行，所以优先读组件状态；
+ * 拿不到组件实例（例如生产构建剥离了内部字段）时退回读可见行。
+ */
+const readBatchSelection = (ctx, panel) => {
+  try {
+    const instance = findVueComponent(ctx, "BatchActionDrawer");
+    if (instance) {
+      const selected = unwrapRef(instance.setupState?.selectedSongs);
+      if (Array.isArray(selected) && selected.length) {
+        return selected.map(songToItem).filter((item) => item.title);
+      }
+    }
+  } catch {}
+
+  if (!panel?.querySelectorAll) return [];
+  const rows = Array.from(panel.querySelectorAll(".batch-row.is-selected"));
+  return rows
+    .map((row) => {
+      const title = row.querySelector(".song-title")?.textContent?.trim() || "";
+      const artist = (row.querySelector(".song-artist-list")?.textContent || "")
+        .split("/")
+        .map((one) => one.trim())
+        .filter(Boolean)
+        .join(" / ");
+      return { title, artist };
+    })
+    .filter((item) => item.title);
 };
 
 /* ------------------------------------------------------------------ *
@@ -1612,10 +1696,155 @@ export function activate(ctx) {
   let settings = { ...DEFAULT_SETTINGS };
   const runtime = createRuntime(ctx, () => settings);
   const proxy = createProxyApi(ctx);
-  const engine = createDownloadEngine({ ctx, runtime, getSettings: () => settings });
+  const engine = createDownloadEngine({
+    ctx,
+    runtime,
+    getSettings: () => settings,
+    onFailed: (task) => {
+      // 批量入队的失败不逐条弹提示（详情看 GD 下载页的队列）
+      if (task.quiet) return;
+      ctx.toast.warning(`下载失败：${task.title}${task.error ? `（${task.error}）` : ""}`);
+    },
+  });
+  const makeRef = ctx.vue?.ref || ((value) => ({ value }));
+  /** 供播放栏徽标使用：未完成的下载数（响应式，宿主重渲染时能读到新值） */
+  const queueCount = makeRef(0);
+  engine.subscribe((snapshot) => {
+    const pending = snapshot.filter(
+      (task) => !["completed", "failed", "canceled"].includes(task.status),
+    ).length;
+    if (queueCount.value !== pending) queueCount.value = pending;
+  });
+
   let disposeResolver = null;
   let disposePage = null;
+  let disposePlayerbar = null;
+  let disposeSongMenu = null;
+  let disposeBatchDom = null;
   let disposed = false;
+
+  /** 播放栏 / 歌曲菜单 / 批量面板共用的入队入口 */
+  const downloadTracks = async (items, label) => {
+    const list = (Array.isArray(items) ? items : []).filter((item) => item && item.title);
+    if (!list.length) {
+      ctx.toast.warning("没有可下载的歌曲");
+      return;
+    }
+    const dir = engine.getDirectory() || (await engine.loadDirectory().catch(() => null));
+    if (!dir) {
+      ctx.toast.warning("请先在「GD 下载」页面选择保存目录");
+      return;
+    }
+    const result = engine.enqueue(list, { quiet: list.length > 1 });
+    if (!result.added) {
+      ctx.toast.info("这些歌曲已经在下载队列里了");
+      return;
+    }
+    ctx.toast.success(
+      `已加入下载队列 ${result.added} 首${label ? `（${label}）` : ""}` +
+        (result.skipped ? `，跳过 ${result.skipped} 首` : ""),
+    );
+  };
+
+  /** 播放栏右侧「下载」按钮（官方 playerbar API） */
+  const registerPlayerbarAction = () => {
+    const playerbar = ctx.ui?.playerbar;
+    if (typeof playerbar?.register !== "function") return;
+    disposePlayerbar = playerbar.register({
+      id: "download-current",
+      title: "下载",
+      icon: "tabler:download",
+      tooltip: "下载当前播放到本地（GD 音源）",
+      defaultPlacement: "right",
+      order: 8,
+      trigger: "click",
+      badge: () => (queueCount.value > 0 ? String(queueCount.value) : null),
+      badgeTitle: "下载队列",
+      badgeDefaultVisible: true,
+      onClick: async () => {
+        const track = ctx.player?.currentTrack;
+        if (!track) {
+          ctx.toast.warning("当前没有播放中的歌曲");
+          return;
+        }
+        await downloadTracks([songToItem(track)], track.title);
+      },
+    });
+  };
+
+  /** 歌曲右键菜单：下载这一首 */
+  const registerSongMenuItem = () => {
+    const register = ctx.ui?.addSongContextMenuItem;
+    if (typeof register !== "function") return;
+    disposeSongMenu = register.call(ctx.ui, {
+      id: "download-song",
+      label: "下载到本地（GD）",
+      order: 40,
+      onSelect: async (song) => {
+        await downloadTracks([songToItem(song)], song?.title);
+      },
+    });
+  };
+
+  /**
+   * 批量操作面板：宿主暂时没有批量扩展 API，只能往底部按钮区注入一个「下载」按钮。
+   * 样式靠复制原生按钮的 data-v-* 作用域属性来复用 scoped CSS，避免看起来像外挂控件。
+   */
+  const setupBatchDownloadButton = () => {
+    const observe = ctx.dom?.observe;
+    if (typeof observe !== "function" || typeof document === "undefined") return;
+    disposeBatchDom = observe.call(ctx.dom, ".batch-footer .batch-actions", (actions) => {
+      if (!actions || actions.nodeType !== 1) return;
+      if (actions.querySelector("[data-gd-batch-download]")) return;
+
+      const sample = actions.querySelector("button");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.gdBatchDownload = "1";
+      button.className = "batch-action gd-batch-download";
+      button.textContent = "下载";
+      button.title = "用 GD 音乐台下载勾选的歌曲";
+      if (sample) {
+        for (const attribute of sample.getAttributeNames()) {
+          if (attribute.startsWith("data-v-")) button.setAttribute(attribute, "");
+        }
+      }
+
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const panel = actions.closest(".batch-drawer") || document.body;
+        const items = readBatchSelection(ctx, panel);
+        if (!items.length) {
+          ctx.toast.warning("请先勾选要下载的歌曲");
+          return;
+        }
+        void downloadTracks(items, `已选 ${items.length} 首`);
+      });
+
+      const danger = actions.querySelector("button.danger");
+      if (danger) actions.insertBefore(button, danger);
+      else actions.appendChild(button);
+
+      // 「下载 (n)」跟随勾选数量变化
+      const countEl = actions.closest(".batch-drawer")?.querySelector(".batch-count");
+      const sync = () => {
+        const matched = /(\d+)\s*\/\s*(\d+)/.exec(countEl?.textContent || "");
+        const count = matched ? Number(matched[1]) : 0;
+        button.textContent = count > 0 ? `下载 ${count}` : "下载";
+        button.disabled = count === 0;
+        button.style.opacity = count === 0 ? "0.5" : "";
+      };
+      const observer = new MutationObserver(sync);
+      if (countEl) observer.observe(countEl, { childList: true, characterData: true, subtree: true });
+      sync();
+
+      return () => {
+        observer.disconnect();
+        button.remove();
+      };
+    });
+  };
 
   const persist = async () => {
     await ctx.storage.set(STORAGE_KEY, settings).catch(() => {});
@@ -1958,6 +2187,23 @@ export function activate(ctx) {
       console.warn(LOG_TAG, "设置面板注册失败", error);
     }
 
+    // 播放栏 / 歌曲菜单 / 批量面板
+    try {
+      registerPlayerbarAction();
+    } catch (error) {
+      console.warn(LOG_TAG, "播放栏按钮注册失败", error);
+    }
+    try {
+      registerSongMenuItem();
+    } catch (error) {
+      console.warn(LOG_TAG, "歌曲菜单注册失败", error);
+    }
+    try {
+      setupBatchDownloadButton();
+    } catch (error) {
+      console.warn(LOG_TAG, "批量面板按钮注入失败", error);
+    }
+
     // 下载页（侧边栏入口）
     try {
       if (typeof ctx.css?.inject === "function") ctx.css.inject(PAGE_CSS, { id: "gd-download" });
@@ -1989,10 +2235,15 @@ export function activate(ctx) {
   const cleanup = () => {
     if (disposed) return;
     disposed = true;
-    try {
-      disposePage?.();
-    } catch {}
+    for (const dispose of [disposePage, disposePlayerbar, disposeSongMenu, disposeBatchDom]) {
+      try {
+        dispose?.();
+      } catch {}
+    }
     disposePage = null;
+    disposePlayerbar = null;
+    disposeSongMenu = null;
+    disposeBatchDom = null;
     disposeResolver?.();
     disposeResolver = null;
   };

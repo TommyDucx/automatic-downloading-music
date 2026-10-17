@@ -304,3 +304,43 @@ manifest 里 `requires.echoMusicVersion` 写 `>=2.2.6` 即可：能力缺失时�
 
 
 
+
+---
+
+# 补充（2026-10-17 下午·二）：把下载入口塞进原生 UI（v1.2.0）
+
+> 用户要的是「播放栏一个下载按钮、批量操作面板一个批量下载」，不是侧栏页面。
+> 结论：**播放栏有官方 API，批量面板没有——只能 DOM 注入**。
+
+## 18. 三个入口的可行性与实现
+
+| 位置 | 官方 API | 做法 |
+|---|---|---|
+| 播放栏右侧 | ✅ `ctx.ui.playerbar.register({ id, title, icon, defaultPlacement:'right', order, badge, onClick })` | 直接用；`badge: () => String(n)` 配一个 Vue `ref` 就能让角标随下载队列更新 |
+| 歌曲右键菜单 | ✅ `ctx.ui.addSongContextMenuItem({ id, label, order, danger, visible, enabled, onSelect(song) })` | 直接用 |
+| 批量操作面板 | ❌ 全仓库搜不到 `batchActions` 扩展点 | `ctx.dom.observe('.batch-footer .batch-actions', el => {...})` 注入按钮 |
+
+**批量面板注入的三个要点**：
+
+1. **样式**：SFC 的 scoped CSS 选择器带 `[data-v-xxxx]`，注入的 `<button>` 不匹配。
+   把原生按钮的 `data-v-*` 属性**全部复制**到新按钮上，就能直接复用 `.batch-action` 的样式，不需要自己写一套。
+2. **选中状态**：`BatchActionDrawer.vue` 里 `selectedSongs` 是组件内 computed，且列表用
+   `useVirtualList` **只渲染可见行**——读 DOM 只能拿到屏幕上那几首，全选 60 首时严重漏项。
+   正确做法是从 Vue 组件树里取实例：`ctx.app._instance` 起 BFS 遍历 `subTree`/`vnode.component`，
+   按 `type.__name === 'BatchActionDrawer'` 命中后读 `instance.setupState.selectedSongs`
+   （`setupState` 是 proxyRefs，computed 会自动解包）。
+   注意 `el.__vueParentComponent` 在生产构建里通常**不存在**（受 `__DEV__ || __FEATURE_PROD_DEVTOOLS__` 保护），
+   所以要走 `ctx.app` 而不是从 DOM 元素往上摸。
+3. **数量联动**：面板顶部的 `.batch-count` 文本形如 `3/60`，用 MutationObserver 盯着它改按钮文案/禁用态即可，
+   不必自己去读选中集合。
+
+**降级**：组件树取不到实例时退回解析 `.batch-row.is-selected` 里的 `.song-title` / `.song-artist-list`，
+只覆盖可见行，但至少不会完全失效。
+
+## 19. 顺带确认的两件事
+
+- 站点签名**时间戳不是冻结的**：同一入参的签名每秒都在变（`6B15EF1A → D695E47A → 135EBDF7`），
+  连续 12 次请求全部 200，所以之前偶发的 `401 Invalid request` 是**测试桩丢了 User-Agent** 导致的，
+  不是签名过期。真机里 `ctx.net.request` 会带浏览器 UA，不受影响。
+- 批量下载失败不要逐条弹 toast：`enqueue(items, { quiet: items.length > 1 })` 给任务打标，
+  失败回调只对单曲入口提示，批量看「GD 下载」页的队列详情。
