@@ -476,7 +476,7 @@ s = md5( ts9 + "|" + location.hostname + "|" + version每段补零2位 + "|" + e
 |---|---|---|
 | 全源搜索返回 `{"code":-32001,"message":"Session with given id not found."}` | 站点**页面级 session 有 TTL**，过期后所有音源全挂（实测王力宏 14/16 一次全灭）。⚠️ 该错误**以非 200 状态码返回**，只判 200 会漏 | `api()` 里**不看状态码**、响应体命中即触发 CDP `Page.reload {ignoreCache:true}` 硬刷新拿新会话再重试（原逻辑只 `ensureOnSite` 查标题不刷新页面，永远救不回来） |
 | xyz 全源 `{"detail":"Invalid request."}`（签名被拒） | **共享 profile 里缓存了陈旧的 `crc32.min.js`/会话**（签名内含 version 串与 ts9） | ① 签名失效时同上硬刷新；② **xyz 一律用隔离 profile + 独立端口**（如 `/tmp/gd-xyz-profile` + 9444），别用共享的 `~/.gd-chrome-profile` |
-| 走代理的 xyz 反复「会话失效→刷新→又失效」死循环 | **Clash 负载均衡轮换出口 IP**（实测采样两次 IP 不同），站点会话绑 IP，页面刷新救不了 | **xyz 直连完全可用**（无头直接过 Cloudflare，15 秒下到 FLAC），补缺一律不走代理。旧「国内访问 xyz 需科学上网」假设作废 |
+| 走代理的 xyz 反复「会话失效→刷新→又失效」死循环 | **Clash 负载均衡轮换出口 IP**（实测采样两次 IP 不同），站点会话绑 IP，页面刷新救不了 | ⚠️ **（2026-10-30 更新）xyz 国内直连 TCP 已不通，此条仅存档**；xyz 现在只能走代理，直连一律改用 org |
 
 **取流级联**（`downloadFile`，解决「搜索命中但下载失败」）：
 `Node fetch` →（网络层 `fetch failed`，undici 对个别 CDN 不行）→ **curl 兜底**（UA/Referer/重试，
@@ -550,6 +550,22 @@ node "$SKILL_DIR/scripts/embeat-recommend.js" --track-id 5pIcwtJYNJx93l420oR2Vm 
 ```bash
 node "$SKILL_DIR/scripts/gd-browser-downloader.js" --list recs.json --out "<文件夹>"
 ```
+
+**⚠️ 两个实战大坑（2026-10-30/31 深夜批量下载实测）：**
+
+1. **会话里残留的失效代理会劫走 curl**：Agent/终端环境常带 `http_proxy=127.0.0.1:<port>`（沙箱代理），
+   对 gdstudio 域名 CONNECT 直接 502——curl 层报 `CONNECT tunnel failed, response 502` 就是它。
+   所有 curl/Node 调用一律套 `env -u http_proxy -u https_proxy -u all_proxy`。
+2. **embeat-recommend 默认 `--site xyz`，xyz 直连已死**：必须显式 `--site org`（org 的
+   embeat_by_track/embeat_agent 都可用）。
+3. **node 后台任务被杀时日志缓冲会丢**：重定向到文件的日志只剩开头几行 ≠ 没干活——
+   **以输出目录里的文件为准**判断成功与否，别只看日志。
+
+**批量分风格下载的成熟流程**（示例：钢琴曲按抒情/爵士/古典/影视分文件夹，实测 82 首一轮跑完）：
+1) 每个风格一条 `--desc "<风格描述>"` 收集（互不重叠的风格词）；
+2) 跨全部推荐池 + 已有曲库**全局去重**后生成每文件夹的 `--list` JSON；
+3) `--direct` 逐文件夹下载（本地盘优先，移动硬盘参考「掉盘」教训）；
+4) 每个子文件夹软链成 `0X-名字-<StyleTag>` 后统一跑 embedder（GENRE 按 StyleTag 分风格写入）。
 
 **原理（为什么不用浏览器、不用本地库）**：
 1) 签名复用站点自己的 `js/crc32.min.js`——丢进 Node `vm`，配 shims
