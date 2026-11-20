@@ -518,6 +518,35 @@ s = md5( ts9 + "|" + location.hostname + "|" + version每段补零2位 + "|" + e
 `Part 2` / `Part 3` 都指向同一首 `Luv(Sic)`，下到两个 30MB 的**完全相同**文件），
 下完务必 `shasum` 查重再入库。
 
+## 扩展：酷狗概念版 VIP 无损（2026-11-20 打通，`--VIP` 场景首选）
+
+**适用**：GD音乐台全音源都搜不到 / 只有 128 的华语歌（陶喆、周杰伦一类版权残缺的歌手）。
+只要账号有**概念版或联合 VIP**（`svip`/`tvip` 任一在期），就能直接拿**明文 FLAC**。
+
+```bash
+# 1) 扫码登录（生成二维码 PNG，用酷狗概念版 App 扫；轮询 10 分钟）
+node "$SKILL_DIR/scripts/kugou-vip-login.js"
+#    二维码 → /tmp/kugou-login-qr.png，凭证 → ~/.kugou-vip-auth.json
+
+# 2) 批量下载（自动搜 SQ→HQ→128、校验 fLaC 魔数）
+node "$SKILL_DIR/scripts/kugou-v5-dl.js" songs.json "<outDir>"
+```
+
+| 环节 | 端点 | 要点 |
+|---|---|---|
+| 登录 | `login-user.kugou.com/v2/qrcode` → `/v2/get_userinfo_qrcode` | **`qrcode_txt` 里 appid 必须是 3116**（概念版身份）；status 4 返回 token+userid |
+| 取流 | `GET gateway.kugou.com/v5/url`（`x-router: trackercdn.kugou.com`） | appid 3116 / clientver 11440 / **version 11436** / page_id 967177915 / pid 411 / cmd 26 → **明文 flac 直链** |
+| 备选（别用） | `tracker.kugou.com/v6/priv_url` | 只回 `.mgg` 加密流（en_tracker_url + en_ekey），要自己解 KGG，绕远路 |
+| 会员判据 | `kugouvip.kugou.com/v1/get_union_vip?busi_type=concept` | 顶层 `is_vip` 恒 0 不可信，**看 `busi_vip[]` 的 is_vip + vip_end_time** |
+
+**四个坑（都实测过）**：
+1. 搜索必须用**无登录态**参数（`token:'' userid:0`）——带概念版 token 搜索返回空列表。
+2. **各音质是不同 hash**：`SQFileHash`(flac) / `HQFileHash`(320) / `FileHash`(128)，拿 128 的 hash 求 flac 只会回 128。
+3. 签名盐：请求级 `LnT6xpN3khm36zse0QzvmgTZ3waWdRSA`；`key = md5(hash + 185672dd44712f60bb1736df5a377e82 + 3116 + mid + userid)`；hash 全小写。
+4. 所有 curl 调用套 `env -u http_proxy -u https_proxy -u all_proxy`（会话代理会劫持成 CONNECT 502）。
+
+详见 `ECHOMUSIC_REFERENCE.md §10`。
+
 ## 扩展：Embeat 歌曲推荐（网页版直连，2026-09-30 打通；无需浏览器、无需本地数据库）
 
 **Embeat 是 GD音乐台自家的推荐系统**（开源：https://github.com/gdstudio-org/Embeat）：
