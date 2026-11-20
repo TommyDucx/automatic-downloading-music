@@ -89,7 +89,8 @@ for (const x of songs) {
       try {
         const res = v5Gateway(c.hash, r.AlbumID || r.album_id || 0, r.MixSongID || r.Audioid || 0);
         if (!res || !res.url) continue;
-        const fn = path.join(outDir, `${a} - ${t}.flac`.trim());
+        const ext = c.q === "flac" ? ".flac" : ".mp3";
+        const fn = path.join(outDir, `${a} - ${t}${ext}`.trim());
         execFileSync("curl", ["-sS", "--max-time", "300", "-L", "-o", fn,
           "-H", "User-Agent: Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi", res.url],
           { maxBuffer: 300 * 1024 * 1024 });
