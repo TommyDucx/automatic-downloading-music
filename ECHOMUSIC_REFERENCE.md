@@ -344,3 +344,23 @@ manifest 里 `requires.echoMusicVersion` 写 `>=2.2.6` 即可：能力缺失时�
   不是签名过期。真机里 `ctx.net.request` 会带浏览器 UA，不受影响。
 - 批量下载失败不要逐条弹 toast：`enqueue(items, { quiet: items.length > 1 })` 给任务打标，
   失败回调只对单曲入口提示，批量看「GD 下载」页的队列详情。
+
+## 10. 酷狗概念版 VIP 无损直取（2026-11-20 打通，`kugou-vip-login.js` + `kugou-v5-dl.js`）
+
+前置：账号有 **概念版/联合 VIP**（`svip`/`tvip` 任一在期即可拿 flac；viper_tape/clear/atmos 需超级 VIP）。
+
+| 环节 | 端点 | 关键点 |
+|---|---|---|
+| 扫码登录 | `https://login-user.kugou.com/v2/qrcode` → `/v2/get_userinfo_qrcode` | web 盐签名；`qrcode_txt` 里的 appid 决定登录身份，概念版填 **3116**；轮询 status 4 返回 `token`+`userid` |
+| 鉴权取流（首选） | `GET https://gateway.kugou.com/v5/url`（`x-router: trackercdn.kugou.com`） | 概念版身份 appid **3116**/clientver **11440** + `version:11436`、`page_id:967177915`、`pid:411`、`cmd:26`；**返回明文 flac/mp3 直链**（priv_status=1 完整） |
+| 鉴权取流（备选） | `POST http://tracker.kugou.com/v6/priv_url` | 只有 `en_tracker_url`（.mgg 加密流）+ `en_ekey`，需 KGG 解密（kgg-dec / OpenConverter）才能用；且 `album_audio_id` 必须字符串、`priv_vip_type` 空时默认 `'6'` |
+| 会员状态 | `GET https://kugouvip.kugou.com/v1/get_union_vip?busi_type=concept` | `busi_vip[].is_vip` + `vip_end_time` 判断在期；顶层 `vip_type` 可能为 0，不能作为判据 |
+
+**签名**：请求级 `signature = md5(盐+params按key排序拼k=v+body+盐)`，概念版盐 `LnT6xpN3khm36zse0QzvmgTZ3waWdRSA`；
+`key = md5(hash + 185672dd44712f60bb1736df5a377e82 + 3116 + mid + userid)`。hash 一律小写。
+
+**坑**：
+- 搜索必须用**无登录态**参数（token:''/userid:0）；带概念版 token 搜索会返回空列表。
+- 各音质是**不同 hash**：搜索结果 `SQFileHash`(flac) / `HQFileHash`(320) / `FileHash`(128)；用 128 的 hash 请求 flac 只会回 128。
+- 早期误判"VIP 过期"：`get_union_vip` 顶层 `is_vip:0, vip_type:0` 正常，真相在 `busi_vip[]`（`vip_end_time` 未来即在期）。
+- 会话环境代理会劫持 curl（`CONNECT 502`），所有调用套 `env -u http_proxy -u https_proxy -u all_proxy`。
